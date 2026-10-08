@@ -1,0 +1,6 @@
+.venv/
+build/
+*.o
+mrt2dump
+*.safetensors
+*.gguf
