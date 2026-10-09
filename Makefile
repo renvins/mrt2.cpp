@@ -9,5 +9,9 @@ mrt2dump: mrt2dump.cpp
 mrt2info: mrt2info.cpp safetensors.cpp json.cpp
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
+tests/test_mmap: tests/test_mmap.cpp mmap.cpp
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+
 clean:
 	rm -f mrt2dump mrt2info
