@@ -16,6 +16,7 @@
 // So a tensor's bytes sit at file position (8 + N + data_offsets[0]) .. .
 #pragma once
 #include <cstdint>
+#include <cstddef>
 #include <map>
 #include <string>
 #include <vector>
@@ -49,5 +50,11 @@ struct SafeTensorsHeader {
 // Returns false and fills `err` on failure.
 bool safetensors_read_header(const std::string &path, SafeTensorsHeader &out,
                              std::string &err);
+
+// Parse a safetensors header from an in-memory image of the whole file
+// (e.g. a MappedFile). Every tensor's dtype, shape and byte range is
+// checked, so later code can trust them. Returns false and fills `err`.
+bool safetensors_parse(const uint8_t *buf, size_t size, SafeTensorsHeader &out,
+                       std::string &err);
 
 } // namespace mrt2

@@ -1,7 +1,7 @@
 // mrt2dump.cpp - print the header JSON of a SafeTensors file.
 //
 // SafeTensors layout:
-//   [8-byte little-endian header length N][N-byte JSON header][tensor data]
+//   [8-bytes little-endian header length N][N-byte JSON header][tensor data]
 //
 // The header maps each tensor name to its dtype, shape, and the byte
 // range holding its data (offsets are relative to the data section).

@@ -2,5 +2,6 @@
 build/
 *.o
 mrt2dump
+mrt2info
 *.safetensors
 *.gguf
