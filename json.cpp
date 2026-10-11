@@ -1,6 +1,7 @@
 #include "json.h"
-#include <cstdlib>
+#include <charconv>
 #include <cstring>
+#include <system_error>
 #include <stdexcept>
 
 namespace mrt2 {
@@ -40,6 +41,7 @@ struct Parser {
     const char *p; // current position
     const char *end; // one past the last byte
     std::string err;
+    int depth = 0; // how many value() calls are active right now
 
     // Record the first error and report failure.
     bool fail(const char *msg) {
@@ -54,6 +56,7 @@ struct Parser {
     }
 
     bool value(Json &out);
+    bool value_inner(Json &out);
     bool string(std::string &out);
     bool literal(const char *word);
     bool number(double &out);
@@ -121,16 +124,32 @@ bool Parser::literal(const char *word) {
     return true;
 }
 
-// Parse a number with strtod; handles signs, fractions and exponents.
+// Parse a number; handles signs, fractions and exponents.
 bool Parser::number(double &out) {
-    char *stop = nullptr;
-    out = std::strtod(p, &stop);
-    if (stop == p) return fail("json: bad number");
-    p = stop;
+    // A JSON number starts with '-' or a digit. This rejects "+1", "inf"
+    // and "nan", which from_chars would otherwise accept.
+    if (*p != '-' && (*p < '0' || *p > '9')) return fail("json: bad number");
+    // from_chars, not strtod: it stops at `end` (strtod needs a '\0' and
+    // reads past the buffer), and it ignores the C locale (under it_IT,
+    // strtod reads "1.5" as 1 because the decimal mark there is ',').
+    auto r = std::from_chars(p, end, out);
+    if (r.ec != std::errc()) return fail("json: bad number");
+    p = r.ptr;
     return true;
 }
 
+// Every nested '{' or '[' recurses once, so a hostile file made of
+// "[[[[..." would overflow the stack. Real headers nest 3 deep.
+static constexpr int kMaxDepth = 64;
+
 bool Parser::value(Json &out) {
+    if (++depth > kMaxDepth) return fail("json: nested too deep");
+    bool ok = value_inner(out);
+    depth--;
+    return ok;
+}
+
+bool Parser::value_inner(Json &out) {
     ws();
     if (p >= end) return fail("json: unexpected end");
     char c = *p;

@@ -44,6 +44,9 @@ bool safetensors_parse(const uint8_t *buf, size_t size, SafeTensorsHeader &out,
         err = "header length exceeds file size";
         return false;
     }
+    // The format caps the header at 100 MB; checking early means a random
+    // file is rejected at once instead of being scanned as JSON.
+    if (hlen > 100'000'000) { err = "header larger than 100 MB"; return false; }
 
     Json root;
     if (!json_parse(reinterpret_cast<const char *>(buf + 8), hlen, root, err)) return false;
@@ -76,9 +79,22 @@ bool safetensors_parse(const uint8_t *buf, size_t size, SafeTensorsHeader &out,
         TensorInfo t;
         t.name = kv.first;
         t.dtype = dt->as_str();
+        uint64_t es = dtype_size(t.dtype);
+        if (es == 0) { err = "unknown dtype " + t.dtype + ": " + t.name; return false; }
+
+        // Multiply the byte size up one dimension at a time, refusing to
+        // go past the data section. That bound also stops the product from
+        // wrapping around: [2^32, 2^32] would otherwise become 0 elements.
+        uint64_t bytes = es;
         for (const Json &d : sh->as_arr()) {
             if (!is_count(d)) { err = "bad shape: " + t.name; return false; }
-            t.shape.push_back((int64_t)d.as_num());
+            uint64_t n = (uint64_t)d.as_num();
+            if (n != 0 && bytes > data_size / n) {
+                err = "shape too large for file: " + t.name;
+                return false;
+            }
+            bytes *= n;
+            t.shape.push_back((int64_t)n);
         }
 
         // data_offsets is the half-open range [begin, end) in the data
@@ -93,14 +109,24 @@ bool safetensors_parse(const uint8_t *buf, size_t size, SafeTensorsHeader &out,
         t.nbytes = end - begin;
 
         // The range must hold exactly numel elements of the dtype.
-        uint64_t es = dtype_size(t.dtype);
-        if (es == 0) { err = "unknown dtype " + t.dtype + ": " + t.name; return false; }
-        if (t.numel() * es != t.nbytes) {
+        if (bytes != t.nbytes) {
             err = "byte size does not match shape: " + t.name;
             return false;
         }
 
-        out.tensors.emplace(t.name, std::move(t));
+        // Each element must start on a multiple of its own size, so the
+        // data can be read through a float* (or int32_t*, ...) directly.
+        // The mapping itself starts on a page boundary.
+        if ((out.data_start + begin) % es != 0) {
+            err = "tensor data is misaligned: " + t.name;
+            return false;
+        }
+
+        // A repeated name would silently hide one of the two tensors.
+        if (!out.tensors.emplace(kv.first, std::move(t)).second) {
+            err = "duplicate tensor: " + kv.first;
+            return false;
+        }
     }
     return true;
 }

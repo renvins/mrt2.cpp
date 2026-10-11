@@ -5,3 +5,6 @@ mrt2dump
 mrt2info
 *.safetensors
 *.gguf
+tests/test_mmap
+tests/test_weights
+*.dSYM/
