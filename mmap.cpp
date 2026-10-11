@@ -1,8 +1,8 @@
 #include "mmap.h"
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN // trims rarely used parts in windows.h
+#define NOMINMAX // not define min and max macros
 #include <windows.h>
 #else
 #include <cerrno>

@@ -37,8 +37,8 @@ namespace {
 
 // A recursive-descent parser over the byte range [p, end).
 struct Parser {
-    const char *p;
-    const char *end;
+    const char *p; // current position
+    const char *end; // one past the last byte
     std::string err;
 
     // Record the first error and report failure.
