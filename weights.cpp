@@ -28,22 +28,32 @@ static std::string shape_str(const int64_t *b, const int64_t *e) {
     return s + "]";
 }
 
-const float *Weights::f32(const std::string &name,
-                          std::initializer_list<int64_t> shape) const {
+const TensorInfo &Weights::checked(const std::string &name, const char *dtype,
+                                   std::initializer_list<int64_t> shape) const {
     const TensorInfo *t = find(name);
     if (!t) throw std::runtime_error("missing tensor: " + name);
-    if (t->dtype != "F32")
-        throw std::runtime_error(name + ": expected F32, got " + t->dtype);
+    if (t->dtype != dtype)
+        throw std::runtime_error(name + ": expected " + dtype + ", got " + t->dtype);
 
     // The 4-iterator std::equal also fails if the ranks differ.
     if (!std::equal(t->shape.begin(), t->shape.end(), shape.begin(), shape.end()))
         throw std::runtime_error(name + ": expected shape " +
                                  shape_str(shape.begin(), shape.end()) + ", got " +
                                  shape_str(t->shape.data(), t->shape.data() + t->shape.size()));
+    return *t;
+}
 
-    // The parser proved [offset, offset + nbytes) lies inside the file and
-    // that the offset is 4-byte aligned, so this pointer is safe to use.
-    return reinterpret_cast<const float *>(raw(*t));
+// For both accessors: the parser proved [offset, offset + nbytes) lies
+// inside the file and that the offset is aligned to the element size, so
+// the returned pointer is safe to use.
+const float *Weights::f32(const std::string &name,
+                          std::initializer_list<int64_t> shape) const {
+    return reinterpret_cast<const float *>(raw(checked(name, "F32", shape)));
+}
+
+const int32_t *Weights::i32(const std::string &name,
+                            std::initializer_list<int64_t> shape) const {
+    return reinterpret_cast<const int32_t *>(raw(checked(name, "I32", shape)));
 }
 
 } // namespace mrt2

@@ -30,6 +30,10 @@ public:
     const float *f32(const std::string &name,
                      std::initializer_list<int64_t> shape) const;
 
+    // Same as f32(), for I32 tensors (e.g. token ids in reference files).
+    const int32_t *i32(const std::string &name,
+                       std::initializer_list<int64_t> shape) const;
+
     // First byte of a tensor's data, for code that walks every tensor
     // (e.g. mrt2info --verify). `t` must come from this object's header.
     const uint8_t *raw(const TensorInfo &t) const {
@@ -39,6 +43,11 @@ public:
     const SafeTensorsHeader &header() const { return hdr_; }
 
 private:
+    // The tensor `name`, after checking it exists and has this dtype and
+    // shape; throws std::runtime_error otherwise.
+    const TensorInfo &checked(const std::string &name, const char *dtype,
+                              std::initializer_list<int64_t> shape) const;
+
     MappedFile file_;
     SafeTensorsHeader hdr_;
 };
