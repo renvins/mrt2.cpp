@@ -5,6 +5,9 @@ mrt2dump
 mrt2info
 *.safetensors
 *.gguf
-tests/test_mmap
-tests/test_weights
+# compiled tests and tools (sources stay tracked)
+tests/test_*
+!tests/*.cpp
+!tests/*.h
+tools/spike_bench
 *.dSYM/
