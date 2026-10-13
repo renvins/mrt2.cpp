@@ -63,6 +63,10 @@ struct CodecWeights {
         int st, sf;                       // upsampling factors (time, freq)
     } block[7];                           // decoder_0 .. decoder_6
     Conv out;                             // output 7x7, 64 -> 2
+    // The output layer's kernel repacked at load time to [cout][kt][kf][cin]:
+    // with only 2 output channels, the vectorized loop has to run over the
+    // input channels instead, which must then be contiguous per tap.
+    std::vector<float> out_packed;
 };
 
 CodecWeights load_codec(const Weights &w);

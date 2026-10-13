@@ -42,6 +42,29 @@ TEST(elu_matches_jax) {
     for (int i = 0; i < 7; i++) CHECK_NEAR(x[i], want[i], 1e-6);
 }
 
+TEST(fast_activations_match_exact_math) {
+    // gelu_tanh and elu use our own vectorizable exp; compare them with the
+    // exact library formulas at 200,000 points across the whole range.
+    const int n = 200000;
+    std::vector<float> x(n), g(n), e(n);
+    for (int i = 0; i < n; i++) x[i] = -30.0f + 40.0f * i / (n - 1); // [-30, 10]
+    g = x;
+    e = x;
+    gelu_tanh(g.data(), n);
+    elu(e.data(), n);
+    double gerr = 0, eerr = 0;
+    for (int i = 0; i < n; i++) {
+        const double v = x[i];
+        const double gw = 0.5 * v * (1 + std::tanh(0.7978845608028654 * (v + 0.044715 * v * v * v)));
+        const double ew = v > 0 ? v : std::expm1(v);
+        gerr = std::max(gerr, std::fabs(g[i] - gw) / std::max(1.0, std::fabs(gw)));
+        eerr = std::max(eerr, std::fabs(e[i] - ew) / std::max(1.0, std::fabs(ew)));
+    }
+    std::printf("      vs exact math on [-30, 10]: gelu max error %.1e, elu max error %.1e\n", gerr, eerr);
+    CHECK(gerr < 1e-6);
+    CHECK(eerr < 1e-6);
+}
+
 TEST(softplus_matches_jax) {
     const float want[7] = {0.048587352f, 0.313261688f, 0.474076986f, 0.693147182f,
                            0.974076986f, 1.313261747f, 3.048587322f};
@@ -282,6 +305,7 @@ TEST(greedy_tokens_match_google) {
 int main(int argc, char **argv) {
     RUN(gelu_tanh_matches_jax);
     RUN(elu_matches_jax);
+    RUN(fast_activations_match_exact_math);
     RUN(softplus_matches_jax);
     RUN(softmax_matches_jax);
     RUN(softcap_matches_jax);

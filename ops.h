@@ -27,6 +27,11 @@ namespace mrt2 {
 void vecmat(const float *x, size_t in, const float *W, size_t ld, size_t cols,
             const float *b, float *y);
 
+// sum_i a[i] * b[i]. Uses 16 independent partial sums: float additions
+// may not be reordered, so a single running sum is one long serial chain
+// that the compiler can't turn into SIMD; 16 separate chains it can.
+float dot(const float *a, const float *b, size_t n);
+
 // y[r] = sum_k W[r*in + k] * x[k]   for r < rows.
 //
 // W is stored [rows][in]: the "[out, in]" layout, used by the attention

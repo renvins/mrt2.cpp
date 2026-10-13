@@ -1,5 +1,7 @@
 #include "ops.h"
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 
 namespace mrt2 {
@@ -19,15 +21,21 @@ void vecmat(const float *x, size_t in, const float *W, size_t ld, size_t cols,
     }
 }
 
+float dot(const float *a, const float *b, size_t n) {
+    float acc[16] = {};
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16)
+        for (int j = 0; j < 16; j++) acc[j] += a[i + j] * b[i + j];
+    float s = 0.0f;
+    for (int j = 0; j < 16; j++) s += acc[j];
+    for (; i < n; i++) s += a[i] * b[i]; // the last n % 16 elements
+    return s;
+}
+
 void matvec(const float *W, size_t rows, size_t in, const float *x, float *y) {
     // [rows][in] layout: each output is a dot product of one contiguous
     // row of W with x, so again W is read front to back once.
-    for (size_t r = 0; r < rows; r++) {
-        const float *row = W + r * in;
-        float acc = 0.0f;
-        for (size_t k = 0; k < in; k++) acc += row[k] * x[k];
-        y[r] = acc;
-    }
+    for (size_t r = 0; r < rows; r++) y[r] = dot(W + r * in, x, in);
 }
 
 // ---- normalization --------------------------------------------------------
@@ -64,18 +72,44 @@ void layernorm(const float *x, const float *gamma, const float *beta, size_t n,
 
 // ---- element-wise -----------------------------------------------------------
 
+// exp(x) built from plain arithmetic, so loops calling it can be
+// vectorized (a call to std::exp can't be):
+//   x = n * ln2 + r, n whole, |r| <= ln2 / 2      (Cody-Waite: ln2 in two
+//                                                    parts keeps r exact)
+//   exp(x) = 2^n * exp(r), exp(r) from a degree-6 polynomial (error ~1e-7),
+//   2^n made directly in the float's exponent bits.
+// Inputs are clamped to [-87, 88], the range of normal float results.
+static inline float fast_exp(float x) {
+    x = x < -87.0f ? -87.0f : x > 88.0f ? 88.0f : x;
+    const float n = std::floor(x * 1.44269504f + 0.5f); // round(x / ln2)
+    float r = x - n * 0.693145752f;                     // ln2, high part
+    r = r - n * 1.42860677e-6f;                         // ln2, low part
+    const float p = 1.0f + r * (1.0f + r * (0.5f + r * (1.0f / 6 + r * (1.0f / 24 + r * (1.0f / 120 + r * (1.0f / 720))))));
+    return p * std::bit_cast<float>(((int32_t)n + 127) << 23);
+}
+
 void gelu_tanh(float *x, size_t n) {
-    const float c = 0.7978845608028654f; // sqrt(2 / pi)
+    // 0.5 * (1 + tanh(y)) == 1 / (1 + exp(-2y)), so
+    // gelu(x) = x / (1 + exp(-2y)) with y = sqrt(2/pi) (x + 0.044715 x^3):
+    // the same function, without tanh and without cancellation near 0.
+    const float c2 = 2.0f * 0.7978845608028654f;
     for (size_t i = 0; i < n; i++) {
         const float v = x[i];
-        x[i] = 0.5f * v * (1.0f + std::tanh(c * (v + 0.044715f * v * v * v)));
+        x[i] = v / (1.0f + fast_exp(-c2 * (v + 0.044715f * v * v * v)));
     }
 }
 
 void elu(float *x, size_t n) {
-    // expm1(v) = exp(v) - 1, computed accurately even for v near 0.
-    for (size_t i = 0; i < n; i++)
-        if (x[i] <= 0.0f) x[i] = std::expm1(x[i]);
+    // x > 0: x. Otherwise exp(x) - 1, except near 0 where that subtraction
+    // would lose digits (exp(x) ~ 1): there the series of expm1 is used,
+    // x + x^2/2 + ... + x^8/8!, exact to float precision for |x| < 0.35.
+    // Every branch is a select, so the loop vectorizes.
+    for (size_t i = 0; i < n; i++) {
+        const float v = x[i];
+        const float series = v * (1.0f + v * (0.5f + v * (1.0f / 6 + v * (1.0f / 24 + v * (1.0f / 120 + v * (1.0f / 720 + v * (1.0f / 5040 + v * (1.0f / 40320))))))));
+        const float neg = v > -0.35f ? series : fast_exp(v) - 1.0f;
+        x[i] = v > 0.0f ? v : neg;
+    }
 }
 
 void softcap(float *x, size_t n, float cap) {

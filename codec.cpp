@@ -1,5 +1,6 @@
 #include "codec.h"
 #include "ops.h"
+#include "profile.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -46,6 +47,12 @@ CodecWeights load_codec(const Weights &w) {
         B.sf = s.sf;
     }
     cw.out = load_conv(w, "output_layer/base_conv_last", 7, 7, 64, 2);
+    const Conv &o = cw.out;
+    cw.out_packed.resize((size_t)o.cout * o.kt * o.kf * o.cin);
+    for (int co = 0; co < o.cout; co++)
+        for (int k = 0; k < o.kt * o.kf; k++)
+            for (int ci = 0; ci < o.cin; ci++)
+                cw.out_packed[((size_t)co * o.kt * o.kf + k) * o.cin + ci] = o.k[((size_t)k * o.cin + ci) * o.cout + co];
     return cw;
 }
 
@@ -68,8 +75,11 @@ void dequantize(const CodecWeights &cw, const int32_t tokens[12], float z[256]) 
 
 // Regular conv, stride 1. Time: causal (kt - 1 zeros of past, none of
 // future). Frequency: `pl` zeros below, `pr` above.
-static Tensor conv2d(const Tensor &x, const Conv &c, int pl, int pr) {
+static Tensor conv2d(const Tensor &x, const Conv &c, int pl, int pr, const char *label) {
     Tensor y(x.t, x.f + pl + pr - c.kf + 1, c.cout);
+    // cost: every output position x every tap x cin x cout; bytes: weights + activations
+    MRT2_PROF(label, 2.0 * y.t * y.f * c.kt * c.kf * c.cin * c.cout,
+              4.0 * ((double)c.kt * c.kf * c.cin * c.cout + x.v.size() + y.v.size()));
     for (int t = 0; t < y.t; t++)
         for (int f = 0; f < y.f; f++) {
             float *out = y.at(t, f);
@@ -93,17 +103,47 @@ static Tensor conv2d(const Tensor &x, const Conv &c, int pl, int pr) {
     return y;
 }
 
+// The same conv for a layer with very few output channels (the output
+// layer: 64 -> 2). Instead of vectorizing over 2 outputs (impossible),
+// each output is one long dot product over taps x input channels, using
+// weights packed as [cout][kt][kf][cin].
+static Tensor conv2d_few_out(const Tensor &x, const Conv &c, const float *packed, int pl, int pr,
+                             const char *label) {
+    Tensor y(x.t, x.f + pl + pr - c.kf + 1, c.cout);
+    MRT2_PROF(label, 2.0 * y.t * y.f * c.kt * c.kf * c.cin * c.cout,
+              4.0 * ((double)c.kt * c.kf * c.cin * c.cout + x.v.size() + y.v.size()));
+    for (int t = 0; t < y.t; t++)
+        for (int f = 0; f < y.f; f++)
+            for (int o = 0; o < c.cout; o++) {
+                float s = c.b[o];
+                for (int kt = 0; kt < c.kt; kt++) {
+                    const int ti = t + kt - (c.kt - 1);
+                    if (ti < 0) continue;
+                    for (int kf = 0; kf < c.kf; kf++) {
+                        const int fi = f + kf - pl;
+                        if (fi < 0 || fi >= x.f) continue;
+                        s += dot(x.at(ti, fi), packed + ((size_t)o * c.kt * c.kf + kt * c.kf + kf) * c.cin, c.cin);
+                    }
+                }
+                y.at(t, f)[o] = s;
+            }
+    return y;
+}
+
 // Transposed conv with stride (st, sf), as Google computes it: insert
 // st-1 / sf-1 zeros between input samples, pad (time: causal, freq:
 // "same"), then a regular correlation with the kernel (not flipped). Only
 // taps that land on a real (non-inserted) sample contribute, so we visit
 // just those: a tap at padded position p reads input p / stride, if
 // p is a multiple of the stride.
-static Tensor conv_transpose2d(const Tensor &x, const Conv &c, int st, int sf) {
+static Tensor conv_transpose2d(const Tensor &x, const Conv &c, int st, int sf, const char *label) {
     const int ptl = c.kt - 1;                        // time: causal
     const int pa = c.kf + sf - 2;                    // freq: "same"
     const int pfl = sf > c.kf - 1 ? c.kf - 1 : (pa + 1) / 2;
     Tensor y(x.t * st, x.f * sf, c.cout);
+    // each output gets (kt/st) x (kf/sf) taps: the real work, no inserted zeros
+    MRT2_PROF(label, 2.0 * y.t * y.f * (c.kt / st) * (c.kf / sf) * c.cin * c.cout,
+              4.0 * ((double)c.kt * c.kf * c.cin * c.cout + x.v.size() + y.v.size()));
     for (int t = 0; t < y.t; t++)
         for (int f = 0; f < y.f; f++) {
             float *out = y.at(t, f);
@@ -128,21 +168,29 @@ static Tensor conv_transpose2d(const Tensor &x, const Conv &c, int st, int sf) {
 }
 
 static Tensor elu_of(Tensor x) {
+    MRT2_PROF("elu", (double)x.v.size(), 8.0 * x.v.size());
     elu(x.v.data(), x.v.size());
     return x;
 }
 
+// Labels for the profiler, per block.
+static const char *const kUpLabel[7] = {"d0.convT", "d1.convT", "d2.convT", "d3.convT", "d4.convT", "d5.convT", "d6.convT"};
+static const char *const kConvLabel[7] = {"d0.3x3", "d1.3x3", "d2.3x3", "d3.3x3", "d4.3x3", "d5.3x3", "d6.3x3"};
+static const char *const kShortLabel[7] = {"d0.1x1", "d1.1x1", "d2.1x1", "d3.1x1", "d4.1x1", "d5.1x1", "d6.1x1"};
+
 // One upsampling block: ELU -> transposed conv -> ELU -> 3x3 conv, plus
 // the shortcut (1x1 conv on the raw input if channels change), repeated
 // to the new size (nearest-neighbour upsampling).
-static Tensor block(const Tensor &x, const CodecWeights::Block &B) {
-    Tensor y = conv2d(elu_of(conv_transpose2d(elu_of(x), B.up, B.st, B.sf)), B.conv, 1, 1);
+static Tensor block(const Tensor &x, const CodecWeights::Block &B, int i) {
+    Tensor y = conv2d(elu_of(conv_transpose2d(elu_of(x), B.up, B.st, B.sf, kUpLabel[i])), B.conv, 1, 1,
+                      kConvLabel[i]);
     Tensor sc;
     const Tensor *s = &x;
     if (B.shortcut.k) {
-        sc = conv2d(x, B.shortcut, 0, 0);
+        sc = conv2d(x, B.shortcut, 0, 0, kShortLabel[i]);
         s = &sc;
     }
+    MRT2_PROF("add", (double)y.v.size(), 12.0 * y.v.size());
     for (int t = 0; t < y.t; t++)
         for (int f = 0; f < y.f; f++) {
             const float *a = s->at(t / B.st, f / B.sf);
@@ -153,12 +201,13 @@ static Tensor block(const Tensor &x, const CodecWeights::Block &B) {
 }
 
 Tensor decode(const CodecWeights &cw, const float *z, int frames, CodecDebug *dbg) {
+    MRT2_STAGE("codec");
     Tensor x(frames, 1, 256);
     std::copy(z, z + (size_t)frames * 256, x.v.begin());
 
     // Input layer: first(x) + b2(elu(b1(x))), all 1x1 convs.
-    Tensor a = conv2d(x, cw.in_first, 0, 0);
-    const Tensor b = conv2d(elu_of(conv2d(x, cw.in_b1, 0, 0)), cw.in_b2, 0, 0);
+    Tensor a = conv2d(x, cw.in_first, 0, 0, "in.1x1");
+    const Tensor b = conv2d(elu_of(conv2d(x, cw.in_b1, 0, 0, "in.1x1")), cw.in_b2, 0, 0, "in.1x1");
     for (size_t i = 0; i < a.v.size(); i++) a.v[i] += b.v[i];
     if (dbg) dbg->input_layer = a;
 
@@ -167,11 +216,11 @@ Tensor decode(const CodecWeights &cw, const float *z, int frames, CodecDebug *db
     a.c = 512;
 
     // Residual unit: x + conv(elu(conv(elu(x)))).
-    const Tensor r = conv2d(elu_of(conv2d(elu_of(a), cw.res_a, 1, 1)), cw.res_b, 1, 1);
+    const Tensor r = conv2d(elu_of(conv2d(elu_of(a), cw.res_a, 1, 1, "res.3x3")), cw.res_b, 1, 1, "res.3x3");
     for (size_t i = 0; i < a.v.size(); i++) a.v[i] += r.v[i];
     if (dbg) dbg->input_res = a;
 
-    const Tensor d0 = block(a, cw.block[0]); // [2T][5][1024]
+    const Tensor d0 = block(a, cw.block[0], 0); // [2T][5][1024]
     if (dbg) dbg->decoder0 = d0;
 
     // Stereo: channels [0, 512) are the left group, [512, 1024) the right;
@@ -182,10 +231,10 @@ Tensor decode(const CodecWeights &cw, const float *z, int frames, CodecDebug *db
         for (int t = 0; t < d0.t; t++)
             for (int f = 0; f < d0.f; f++) std::copy(d0.at(t, f) + 512 * g, d0.at(t, f) + 512 * (g + 1), h.at(t, f));
         for (int i = 1; i < 7; i++) {
-            h = block(h, cw.block[i]);
+            h = block(h, cw.block[i], i);
             if (dbg) dbg->block[i - 1][g] = h;
         }
-        const Tensor o = conv2d(elu_of(h), cw.out, 3, 3); // [4T][480][2]: real, imag
+        const Tensor o = conv2d_few_out(elu_of(h), cw.out, cw.out_packed.data(), 3, 3, "out.7x7"); // [4T][480][2]
         for (int t = 0; t < o.t; t++)
             for (int f = 0; f < o.f; f++) {
                 spec.at(t, f)[2 * g] = o.at(t, f)[0];
@@ -199,7 +248,10 @@ Tensor decode(const CodecWeights &cw, const float *z, int frames, CodecDebug *db
 // ---- inverse STFT ---------------------------------------------------------------
 
 std::vector<float> inverse_stft(const Tensor &spec) {
+    MRT2_STAGE("codec");
     const int N = 960, H = 480, bins = 480; // frame length, hop, stored bins
+    // direct inverse DFT: per step and channel, 960 outputs x 480 bins x 4 flops
+    MRT2_PROF("istft", 4.0 * spec.t * 2 * N * bins, 4.0 * spec.v.size());
     const double pi = 3.14159265358979323846;
     // Periodic Hann window, and Google's correction that makes the
     // half-overlapped windows add up to exactly 1: w / (w[n]^2 + w[n+H]^2).

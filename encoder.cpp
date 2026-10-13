@@ -1,5 +1,6 @@
 #include "encoder.h"
 #include "ops.h"
+#include "profile.h"
 #include <cassert>
 #include <cmath>
 
@@ -102,6 +103,9 @@ EncoderWeights load_encoder(const Weights &w) {
 
 void encode(const EncoderWeights &e, const int32_t tokens[kCondTokens], float out[kEncDim],
             EncoderDebug *dbg) {
+    MRT2_STAGE("encoder");
+    MRT2_PROF("encode", 2.0 * (12 * 768 + 768 * 256 + 132 * 256),
+              4.0 * (12 * 768 + 768 * 256 + 132 * 256));
     // --- MusicCoCa branch: sum the 12 token embeddings, then project ----
     // Level k's tokens live in rows [k * 1031, (k + 1) * 1031).
     float sum[768] = {};

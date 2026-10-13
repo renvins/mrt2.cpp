@@ -1,4 +1,5 @@
 #include "temporal.h"
+#include "profile.h"
 #include <algorithm>
 #include <string>
 
@@ -28,6 +29,8 @@ TemporalState::TemporalState()
 // ---- the input --------------------------------------------------------------
 
 void temporal_input(const TemporalWeights &tw, const int32_t prev[kLevels], float x[kModel]) {
+    MRT2_STAGE("temporal");
+    MRT2_PROF("embed", 2.0 * kLevels * kModel, 4.0 * kLevels * kModel);
     // Google: embed each token, scale by sqrt(1024) = 32, then average the
     // 12 levels. Same order of operations here.
     double sum[kModel] = {};
@@ -44,6 +47,7 @@ void temporal_step(const TemporalWeights &tw, TemporalState &st, const float x_i
                    const float e[256], float out[kModel], TemporalDebug *dbg) {
     // Ring buffer: frame t writes slot t % 42. Until the buffer is full the
     // valid slots are 0..t; afterwards all 42 are valid.
+    MRT2_STAGE("temporal");
     const int slot = (int)(st.frames % kSlots);
     const int n = st.frames + 1 < kSlots ? (int)st.frames + 1 : kSlots;
 

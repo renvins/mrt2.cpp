@@ -38,6 +38,11 @@ struct DepthWeights {
     const float *ln_scale, *ln_bias; // final LayerNorm [768]
     const float *logits_w;       // [768][12294]
     const float *logits_b;       // [12294]
+    // Each level's 1024 logit columns copied at load time into one
+    // contiguous block, [12][768][1024]: reading a 1024-column slice
+    // straight out of the 12294-wide matrix jumps 45 KB between rows,
+    // which the memory prefetcher handles badly (measured: 34% of bandwidth).
+    std::vector<float> logits_packed;
 };
 
 DepthWeights load_depth(const Weights &w);

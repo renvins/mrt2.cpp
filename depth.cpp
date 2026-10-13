@@ -1,4 +1,5 @@
 #include "depth.h"
+#include "profile.h"
 #include <algorithm>
 #include <string>
 
@@ -19,10 +20,17 @@ DepthWeights load_depth(const Weights &w) {
     dw.ln_bias = w.f32(d + "final_ln/bias", {kDepthModel});
     dw.logits_w = w.f32(d + "to_logits/kernel", {kDepthModel, kVocab});
     dw.logits_b = w.f32(d + "to_logits/bias", {kVocab});
+    dw.logits_packed.resize((size_t)kLevels * kDepthModel * kCodebook);
+    for (int k = 0; k < kLevels; k++)
+        for (int i = 0; i < kDepthModel; i++) {
+            const float *src = dw.logits_w + (size_t)i * kVocab + kReserved + (size_t)k * kCodebook;
+            std::copy(src, src + kCodebook, &dw.logits_packed[((size_t)k * kDepthModel + i) * kCodebook]);
+        }
     return dw;
 }
 
 int sample_code(float logits[kCodebook], const Sampling &s, Rng &rng) {
+    MRT2_PROF("sample", 8.0 * kCodebook, 4.0 * kCodebook);
     // The soft-cap never changes which logit is largest (greedy picks the
     // same code), but it squeezes large logits together, which raises the
     // chance of the runners-up when sampling with temperature.
@@ -32,6 +40,7 @@ int sample_code(float logits[kCodebook], const Sampling &s, Rng &rng) {
 
 void depth_frame(const DepthWeights &dw, DepthState &st, const float t[kModel], const Sampling &s,
                  Rng &rng, int32_t tokens[kLevels], DepthDebug *dbg) {
+    MRT2_STAGE("depth");
     const size_t layer_slots = (size_t)kLevels * kDepthModel; // one layer's slots
 
     float input[kModel];
@@ -39,7 +48,10 @@ void depth_frame(const DepthWeights &dw, DepthState &st, const float t[kModel], 
     for (int k = 0; k < kLevels; k++) {
         // adapter: 1024 -> 768
         float x[kDepthModel];
-        vecmat(input, kModel, dw.adapter, kDepthModel, kDepthModel, nullptr, x);
+        {
+            MRT2_PROF("adapter", 2.0 * kModel * kDepthModel, 4.0 * kModel * kDepthModel);
+            vecmat(input, kModel, dw.adapter, kDepthModel, kDepthModel, nullptr, x);
+        }
         if (dbg && dbg->adapter) std::copy(x, x + kDepthModel, dbg->adapter + k * kDepthModel);
 
         // 2 layers; step k attends over steps 0..k of this frame
@@ -49,18 +61,26 @@ void depth_frame(const DepthWeights &dw, DepthState &st, const float t[kModel], 
             ffn_block(dw.layer[l].ffn, x);
         }
         float h[kDepthModel];
-        layernorm(x, dw.ln_scale, dw.ln_bias, kDepthModel, 1e-6f, h);
+        {
+            MRT2_PROF("norm", 6.0 * kDepthModel, 8.0 * kDepthModel);
+            layernorm(x, dw.ln_scale, dw.ln_bias, kDepthModel, 1e-6f, h);
+        }
         if (dbg && dbg->final_ln) std::copy(h, h + kDepthModel, dbg->final_ln + k * kDepthModel);
 
         // Only this level's 1024 columns of the 12294: a column slice.
         const size_t c0 = kReserved + (size_t)k * kCodebook;
         float logits[kCodebook];
-        vecmat(h, kDepthModel, dw.logits_w + c0, kVocab, kCodebook, dw.logits_b + c0, logits);
+        {
+            MRT2_PROF("logits", 2.0 * kDepthModel * kCodebook, 4.0 * kDepthModel * kCodebook);
+            vecmat(h, kDepthModel, &dw.logits_packed[(size_t)k * kDepthModel * kCodebook], kCodebook,
+                   kCodebook, dw.logits_b + c0, logits);
+        }
         if (dbg && dbg->logits) std::copy(logits, logits + kCodebook, dbg->logits + k * kCodebook);
 
         tokens[k] = (int32_t)c0 + sample_code(logits, s, rng);
 
         // The next step's input: the chosen token, embedded and scaled.
+        MRT2_PROF("embed", 1.0 * kModel, 8.0 * kModel);
         const float *row = dw.embedding + (size_t)tokens[k] * kModel;
         for (int i = 0; i < kModel; i++) input[i] = row[i] * 32.0f;
     }

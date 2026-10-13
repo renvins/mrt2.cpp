@@ -1,5 +1,6 @@
 #include "blocks.h"
 #include "ops.h"
+#include "profile.h"
 #include <cassert>
 #include <cmath>
 
@@ -77,27 +78,63 @@ static void attend(const AttentionWeights &a, const float *q, const float *keys,
 void attention_block(const AttentionWeights &a, float *x, const float *src, int src_dim,
                      float *keys, float *values, int slot, int n) {
     const int m = a.model;
+    const double mm = (double)m * m, km = (double)src_dim * m; // matrix sizes
     float u[kMaxModel], q[kMaxModel], ctx[kMaxModel], y[kMaxModel];
-    rmsnorm(x, a.pre_norm, m, 1e-6f, u);
-    vecmat(u, m, a.wq, m, m, nullptr, q);
-    // Self-attention projects the normalized x; cross-attention projects src.
-    const float *kv_in = src ? src : u;
-    vecmat(kv_in, src_dim, a.wk, m, m, nullptr, keys + (size_t)slot * m);
-    vecmat(kv_in, src_dim, a.wv, m, m, nullptr, values + (size_t)slot * m);
-    attend(a, q, keys, values, n, ctx);
-    matvec(a.wo, m, m, ctx, y); // Wo is [out][in]
-    rmsnorm(y, a.post_norm, m, 1e-6f, y);
-    for (int i = 0; i < m; i++) x[i] += y[i];
+    {
+        MRT2_PROF("norm", 4.0 * m, 8.0 * m);
+        rmsnorm(x, a.pre_norm, m, 1e-6f, u);
+    }
+    {
+        MRT2_PROF("attn.q", 2 * mm, 4 * mm);
+        vecmat(u, m, a.wq, m, m, nullptr, q);
+    }
+    {
+        // Self-attention projects the normalized x; cross-attention projects src.
+        MRT2_PROF("attn.kv", 4 * km, 8 * km);
+        const float *kv_in = src ? src : u;
+        vecmat(kv_in, src_dim, a.wk, m, m, nullptr, keys + (size_t)slot * m);
+        vecmat(kv_in, src_dim, a.wv, m, m, nullptr, values + (size_t)slot * m);
+    }
+    {
+        // scores (n x 128 per head) + weighted sum of values: reads all n keys and values
+        MRT2_PROF("attn.core", 4.0 * n * m, 8.0 * n * m);
+        attend(a, q, keys, values, n, ctx);
+    }
+    {
+        MRT2_PROF("attn.out", 2 * mm, 4 * mm);
+        matvec(a.wo, m, m, ctx, y); // Wo is [out][in]
+    }
+    {
+        MRT2_PROF("norm", 5.0 * m, 12.0 * m);
+        rmsnorm(y, a.post_norm, m, 1e-6f, y);
+        for (int i = 0; i < m; i++) x[i] += y[i];
+    }
 }
 
 void ffn_block(const FFNWeights &f, float *x) {
+    const double mh = (double)f.model * f.hidden;
     float u[kMaxModel], y[kMaxModel], h[kMaxHidden]; // 24 KB of stack: fine
-    rmsnorm(x, f.pre_norm, f.model, 1e-6f, u);
-    vecmat(u, f.model, f.w1, f.hidden, f.hidden, f.b1, h);
-    gelu_tanh(h, f.hidden);
-    vecmat(h, f.hidden, f.w2, f.model, f.model, f.b2, y);
-    rmsnorm(y, f.post_norm, f.model, 1e-6f, y);
-    for (int i = 0; i < f.model; i++) x[i] += y[i];
+    {
+        MRT2_PROF("norm", 4.0 * f.model, 8.0 * f.model);
+        rmsnorm(x, f.pre_norm, f.model, 1e-6f, u);
+    }
+    {
+        MRT2_PROF("ffn.up", 2 * mh, 4 * mh);
+        vecmat(u, f.model, f.w1, f.hidden, f.hidden, f.b1, h);
+    }
+    {
+        MRT2_PROF("gelu", f.hidden, 8.0 * f.hidden);
+        gelu_tanh(h, f.hidden);
+    }
+    {
+        MRT2_PROF("ffn.down", 2 * mh, 4 * mh);
+        vecmat(h, f.hidden, f.w2, f.model, f.model, f.b2, y);
+    }
+    {
+        MRT2_PROF("norm", 5.0 * f.model, 12.0 * f.model);
+        rmsnorm(y, f.post_norm, f.model, 1e-6f, y);
+        for (int i = 0; i < f.model; i++) x[i] += y[i];
+    }
 }
 
 } // namespace mrt2

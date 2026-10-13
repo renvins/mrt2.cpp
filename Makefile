@@ -7,8 +7,8 @@ STD = -std=c++20
 # Shared code, named once. Headers are listed as prerequisites so that
 # editing one rebuilds what uses it; $(filter %.cpp,$^) then passes only
 # the .cpp files to the compiler.
-CORE       = weights.cpp safetensors.cpp json.cpp mmap.cpp \
-             weights.h safetensors.h json.h mmap.h
+CORE       = weights.cpp safetensors.cpp json.cpp mmap.cpp profile.cpp \
+             weights.h safetensors.h json.h mmap.h profile.h
 MODEL_SRC  = ops.cpp ops.h blocks.cpp blocks.h encoder.cpp encoder.h temporal.cpp temporal.h \
              depth.cpp depth.h codec.cpp codec.h
 BUILD      = $(CXX) $(STD) $(CXXFLAGS) -o $@ $(filter %.cpp,$^)
@@ -55,6 +55,14 @@ tools/spike_bench: tools/spike_bench.cpp ops.cpp ops.h $(CORE)
 spike: tools/spike_bench
 	./tools/spike_bench "$(MODEL)"
 
+# Benchmark (step 8): the real model with the profiler on, built the way
+# release code will be. `make bench` prints the roofline table.
+tools/bench: tools/bench.cpp $(MODEL_SRC) $(CORE)
+	$(CXX) $(STD) -O3 $(NATIVE) -DMRT2_PROFILE -Wall -Wextra -o $@ $(filter %.cpp,$^)
+
+bench: tools/bench
+	./tools/bench "$(MODEL)"
+
 # The tests read the real model; the ones in REF_TESTS also compare with
 # Google's numbers (create those once with `make ref`).
 # Override the paths with `make test MODEL=... REF=...`.
@@ -78,7 +86,7 @@ ref:
 	.venv/bin/python tools/check_spec.py "$(REF)" "$(MODEL)"
 
 clean:
-	rm -f mrt2 mrt2dump mrt2info $(TESTS) tools/spike_bench
+	rm -f mrt2 mrt2dump mrt2info $(TESTS) tools/spike_bench tools/bench
 	rm -rf *.dSYM tests/*.dSYM tools/*.dSYM
 
-.PHONY: all clean test ref spike
+.PHONY: all clean test ref spike bench
