@@ -44,6 +44,11 @@ struct TemporalWeights {
 // missing or has the wrong shape.
 TemporalWeights load_temporal(const Weights &w);
 
+// Switch the decoder to int8 matrix products (quant.h): ~4x fewer bytes
+// read per frame, ~1% error per product. Without it: exact float32, the
+// mode the tests compare against Google's numbers.
+void make_int8(TemporalWeights &tw);
+
 // Everything that carries over from one frame to the next: the keys and
 // values of the last 42 frames for every layer. About 8 MB; allocated
 // once, never during generation.

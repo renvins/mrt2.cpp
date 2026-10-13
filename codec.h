@@ -23,8 +23,12 @@
 // like Google's streaming output, frame 0 is silent and frame t is the
 // audio that frame t's tokens complete.
 //
-// This is the offline version (a whole clip at once, simple loops); the
-// real-time streaming version comes in the speed phase.
+// Two ways to run it, with the same results:
+//   offline   decode() + inverse_stft(): a whole clip at once (the
+//             reference for tests);
+//   streaming decode_frame(): one frame in, its 1920 samples out, with no
+//             limit on length. Every conv is causal in time, so each one
+//             only needs to remember its last few input rows (CodecStream).
 #pragma once
 #include "conv.h"
 #include "weights.h"
@@ -69,6 +73,26 @@ Tensor decode(const CodecWeights &cw, const float *z, int frames, CodecDebug *db
 // spectrum [4 * frames][480][4] -> interleaved stereo float samples
 // [frames * 1920][2]. Frame 0 is silent (see the lookahead note above).
 std::vector<float> inverse_stft(const Tensor &spectrum);
+
+// ---- streaming --------------------------------------------------------------------
+
+// Everything the decoder remembers between frames: for each causal conv
+// its last input rows (as many as its kernel reaches back: 2 for a 3x3,
+// 6 for the 7x7, 1 for a stride-2 transposed conv), and the second half of
+// the last inverse-STFT window. Starts as zeros, exactly the causal
+// padding the offline decoder sees. A few hundred KB; the first frame
+// sizes it, later frames reuse it.
+struct CodecStream {
+    Tensor res_a, res_b;          // input residual unit
+    Tensor up[7][2], conv[7][2];  // block i, stereo group g (block 0: g = 0 only)
+    Tensor out[2];                // output 7x7, per group
+    float overlap[2][480] = {};   // per channel
+    long frame = 0;               // frames decoded so far
+};
+
+// One frame: z[256] -> 1920 stereo samples, interleaved (L, R, L, R...).
+// Frame t's samples equal the offline decoder's samples for frame t.
+void decode_frame(const CodecWeights &cw, CodecStream &st, const float z[256], float out[2 * kSamplesPerFrame]);
 
 // Float sample -> 16-bit, exactly as Google: round(32767.5 * clip(0.5 x) - 0.5).
 int16_t to_int16(float x);

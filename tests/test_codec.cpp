@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -133,6 +134,31 @@ TEST(audio_from_our_tokens_matches_google) {
     CHECK(off_by_one < (int)audio.size() / 100); // and rounding differences rare
 }
 
+TEST(streaming_equals_offline) {
+    // The streaming decoder, one frame at a time with its remembered conv
+    // rows, against the offline decoder on the whole clip: same samples.
+    // Google's z for 50 frames (2 s), so this also checks against Google.
+    const CodecWeights cw = load_codec(*W);
+    const float *z = R->f32("codec/z", {FRAMES, 256});
+    const int32_t *g_audio = R->i32("audio/int16", {FRAMES, kSamplesPerFrame, 2});
+    const std::vector<float> offline = inverse_stft(decode(cw, z, FRAMES));
+    std::vector<float> stream((size_t)FRAMES * kSamplesPerFrame * 2);
+    CodecStream st;
+    for (int f = 0; f < FRAMES; f++) decode_frame(cw, st, z + f * 256, &stream[(size_t)f * kSamplesPerFrame * 2]);
+
+    double maxdiff = 0;
+    int vs_google = 0;
+    for (size_t i = 0; i < stream.size(); i++) {
+        maxdiff = std::max(maxdiff, (double)std::fabs(stream[i] - offline[i]));
+        vs_google = std::max(vs_google, std::abs((int)to_int16(stream[i]) - g_audio[i]));
+    }
+    const bool same = std::memcmp(stream.data(), offline.data(), stream.size() * 4) == 0;
+    std::printf("      %d frames streamed: %s offline (max difference %.3g); vs Google max |int16 diff| %d\n",
+                FRAMES, same ? "bit-identical to" : "NOT identical to", maxdiff, vs_google);
+    CHECK(same);
+    CHECK(vs_google <= 1);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         std::printf("usage: %s MODEL.safetensors REF.safetensors\n", argv[0]);
@@ -150,6 +176,7 @@ int main(int argc, char **argv) {
         RUN(dequantize_matches_google);
         RUN(decoder_blocks_match_google);
         RUN(audio_from_our_tokens_matches_google);
+        RUN(streaming_equals_offline);
     } catch (const std::runtime_error &e) { // a missing/mis-shaped tensor
         std::printf("    FAIL %s\n", e.what());
         test::failures++;

@@ -1,6 +1,7 @@
 #include "blocks.h"
 #include "ops.h"
 #include "profile.h"
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 
@@ -41,6 +42,22 @@ FFNWeights load_ffn(const Weights &w, const std::string &p, int model, int hidde
     f.b2 = w.f32(p + "ffn_layer2/bias", {model});
     f.post_norm = w.f32(p + "post_norm/scale", {model});
     return f;
+}
+
+void make_int8(AttentionWeights &a, int kv_in, bool self) {
+    const int m = a.model;
+    a.q8_in = a.q8_kv = a.q8_o = QMatrix();
+    q8_append_kernel(a.q8_in, a.wq, m, m, 0, m);
+    QMatrix &kv = self ? a.q8_in : a.q8_kv; // self: k and v follow q
+    q8_append_kernel(kv, a.wk, kv_in, m, 0, m);
+    q8_append_kernel(kv, a.wv, kv_in, m, 0, m);
+    q8_append_rows(a.q8_o, a.wo, m, m);
+}
+
+void make_int8(FFNWeights &f) {
+    f.q8_w1 = f.q8_w2 = QMatrix();
+    q8_append_kernel(f.q8_w1, f.w1, f.model, f.hidden, 0, f.hidden);
+    q8_append_kernel(f.q8_w2, f.w2, f.hidden, f.model, 0, f.model);
 }
 
 static float dot(const float *a, const float *b, int n) {
@@ -84,16 +101,36 @@ void attention_block(const AttentionWeights &a, float *x, const float *src, int 
         MRT2_PROF("norm", 4.0 * m, 8.0 * m);
         rmsnorm(x, a.pre_norm, m, 1e-6f, u);
     }
-    {
-        MRT2_PROF("attn.q", 2 * mm, 4 * mm);
-        vecmat(u, m, a.wq, m, m, nullptr, q);
-    }
-    {
+    float *key = keys + (size_t)slot * m, *value = values + (size_t)slot * m;
+    if (a.q8_o.rows && !src) {
+        // int8, self-attention: q, k and v in one product.
+        MRT2_PROF("attn.qkv", 6 * mm, q8_bytes(3 * mm));
+        float qkv[3 * kMaxModel];
+        q8_matvec(a.q8_in, u, nullptr, qkv);
+        std::copy(qkv, qkv + m, q);
+        std::copy(qkv + m, qkv + 2 * m, key);
+        std::copy(qkv + 2 * m, qkv + 3 * m, value);
+    } else if (a.q8_o.rows) {
+        // int8, cross-attention: k and v come from src.
+        {
+            MRT2_PROF("attn.q", 2 * mm, q8_bytes(mm));
+            q8_matvec(a.q8_in, u, nullptr, q);
+        }
+        MRT2_PROF("attn.kv", 4 * km, q8_bytes(2 * km));
+        float kv[2 * kMaxModel];
+        q8_matvec(a.q8_kv, src, nullptr, kv);
+        std::copy(kv, kv + m, key);
+        std::copy(kv + m, kv + 2 * m, value);
+    } else {
+        {
+            MRT2_PROF("attn.q", 2 * mm, 4 * mm);
+            vecmat(u, m, a.wq, m, m, nullptr, q);
+        }
         // Self-attention projects the normalized x; cross-attention projects src.
         MRT2_PROF("attn.kv", 4 * km, 8 * km);
         const float *kv_in = src ? src : u;
-        vecmat(kv_in, src_dim, a.wk, m, m, nullptr, keys + (size_t)slot * m);
-        vecmat(kv_in, src_dim, a.wv, m, m, nullptr, values + (size_t)slot * m);
+        vecmat(kv_in, src_dim, a.wk, m, m, nullptr, key);
+        vecmat(kv_in, src_dim, a.wv, m, m, nullptr, value);
     }
     {
         // scores (n x 128 per head) + weighted sum of values: reads all n keys and values
@@ -101,8 +138,9 @@ void attention_block(const AttentionWeights &a, float *x, const float *src, int 
         attend(a, q, keys, values, n, ctx);
     }
     {
-        MRT2_PROF("attn.out", 2 * mm, 4 * mm);
-        matvec(a.wo, m, m, ctx, y); // Wo is [out][in]
+        MRT2_PROF("attn.out", 2 * mm, a.q8_o.rows ? q8_bytes(mm) : 4 * mm);
+        if (a.q8_o.rows) q8_matvec(a.q8_o, ctx, nullptr, y);
+        else matvec(a.wo, m, m, ctx, y); // Wo is [out][in]
     }
     {
         MRT2_PROF("norm", 5.0 * m, 12.0 * m);
@@ -119,16 +157,18 @@ void ffn_block(const FFNWeights &f, float *x) {
         rmsnorm(x, f.pre_norm, f.model, 1e-6f, u);
     }
     {
-        MRT2_PROF("ffn.up", 2 * mh, 4 * mh);
-        vecmat(u, f.model, f.w1, f.hidden, f.hidden, f.b1, h);
+        MRT2_PROF("ffn.up", 2 * mh, f.q8_w1.rows ? q8_bytes(mh) : 4 * mh);
+        if (f.q8_w1.rows) q8_matvec(f.q8_w1, u, f.b1, h);
+        else vecmat(u, f.model, f.w1, f.hidden, f.hidden, f.b1, h);
     }
     {
         MRT2_PROF("gelu", f.hidden, 8.0 * f.hidden);
         gelu_tanh(h, f.hidden);
     }
     {
-        MRT2_PROF("ffn.down", 2 * mh, 4 * mh);
-        vecmat(h, f.hidden, f.w2, f.model, f.model, f.b2, y);
+        MRT2_PROF("ffn.down", 2 * mh, f.q8_w2.rows ? q8_bytes(mh) : 4 * mh);
+        if (f.q8_w2.rows) q8_matvec(f.q8_w2, h, f.b2, y);
+        else vecmat(h, f.hidden, f.w2, f.model, f.model, f.b2, y);
     }
     {
         MRT2_PROF("norm", 5.0 * f.model, 12.0 * f.model);

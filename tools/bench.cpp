@@ -16,18 +16,20 @@
 // compute-bound (SIMD, register blocking, fewer flops help). "% of limit"
 // says how much headroom is left before the hardware stops you.
 //
-// Built with -DMRT2_PROFILE. Usage:  tools/bench MODEL.safetensors [frames]
+// Built with -DMRT2_PROFILE. Usage:  tools/bench MODEL.safetensors [frames] [threads] [int8|fp32]
 #include "../codec.h"
 #include "../depth.h"
 #include "../encoder.h"
 #include "../profile.h"
 #include "../temporal.h"
+#include "../threads.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <thread>
 #include <vector>
 #if defined(__ARM_NEON)
@@ -114,28 +116,43 @@ static double bandwidth_gbs(int threads) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s mrt2_small.safetensors [frames]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s mrt2_small.safetensors [frames] [threads] [int8|fp32]\n", argv[0]);
         return 1;
     }
     const int frames = argc >= 3 ? std::atoi(argv[2]) : 50;
-#if defined(__APPLE__)
+    const int hw0 = (int)std::thread::hardware_concurrency();
+    const int threads = argc >= 4 ? std::atoi(argv[3]) : hw0;
+    const bool int8 = argc < 5 || std::string(argv[4]) != "fp32";
     // Apple chips mix performance and efficiency cores, and macOS may run a
     // thread started from a script on an efficiency core (~3x slower),
-    // making results swing between runs. "User-interactive" QoS asks for the
-    // performance cores, like a real-time audio engine will.
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
-    const int hw = (int)std::thread::hardware_concurrency();
+    // making results swing between runs. Ask for the performance cores, as
+    // the engine itself does.
+    prefer_performance_cores();
 
     std::printf("=== machine limits ===\n");
     // Best of 5: the first runs can catch the core still raising its clock
     // speed (or briefly on an efficiency core); a limit is the best it can do.
     double P = 0;
     for (int r = 0; r < 5; r++) P = std::max(P, peak_gflops());
-    const double W1 = bandwidth_gbs(1), WN = bandwidth_gbs(hw);
-    std::printf("peak arithmetic, 1 core:  %6.1f GFLOP/s\n", P);
-    std::printf("memory bandwidth, 1 thread: %5.1f GB/s | %d threads: %5.1f GB/s\n", W1, hw, WN);
-    std::printf("ridge point (1 core): %.1f flops per byte; below it an operation is memory-bound\n", P / W1);
+    // All cores at once: every thread runs the peak loop, and we add them up.
+    double PN = 0;
+    for (int r = 0; r < 3; r++) {
+        std::vector<double> got(threads);
+        std::vector<std::thread> ts;
+        for (int i = 0; i < threads; i++)
+            ts.emplace_back([&, i] { prefer_performance_cores(); got[i] = peak_gflops(); });
+        for (auto &th : ts) th.join();
+        double sum = 0;
+        for (double g : got) sum += g;
+        PN = std::max(PN, sum);
+    }
+    const double W1 = bandwidth_gbs(1), WN = bandwidth_gbs(threads);
+    std::printf("peak arithmetic: 1 core %6.1f GFLOP/s | %d threads %6.1f GFLOP/s\n", P, threads, PN);
+    std::printf("memory bandwidth: 1 thread %5.1f GB/s | %d threads %5.1f GB/s\n", W1, threads, WN);
+    set_threads(threads);
+    // The limits that apply to this run: one core, or all the threads used.
+    const double Plim = threads > 1 ? PN : P, Wlim = threads > 1 ? WN : W1;
+    std::printf("ridge point: %.1f flops per byte; below it an operation is memory-bound\n", Plim / Wlim);
 
     Weights w;
     std::string err;
@@ -144,9 +161,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     const EncoderWeights ew = load_encoder(w);
-    const TemporalWeights tw = load_temporal(w);
-    const DepthWeights dw = load_depth(w);
+    TemporalWeights tw = load_temporal(w);
+    DepthWeights dw = load_depth(w);
     const CodecWeights cw = load_codec(w);
+    if (int8) {
+        make_int8(tw);
+        make_int8(dw);
+    }
 
     // Jazz preset, Google's default sampling: a realistic run.
     Conditioning cond;
@@ -169,12 +190,15 @@ int main(int argc, char **argv) {
         prof::reset();
     }
 
+    // The engine's loop: tokens, then the streaming codec, per frame.
     TemporalState ts;
     DepthState ds;
+    CodecStream cs;
     Rng rng(0);
-    std::vector<float> z((size_t)frames * 256), frame_ms(frames);
+    std::vector<float> frame_ms(frames);
     int32_t prev[kLevels] = {};
-    float e[256], x[kModel], t[kModel];
+    float e[256], x[kModel], t[kModel], z[256], audio[2 * kSamplesPerFrame];
+    double tok = 0, codec = 0;
     auto t0 = Clock::now();
     for (int f = 0; f < frames; f++) {
         auto a = Clock::now();
@@ -182,28 +206,33 @@ int main(int argc, char **argv) {
         temporal_input(tw, prev, x);
         temporal_step(tw, ts, x, e, t);
         depth_frame(dw, ds, t, Sampling{}, rng, prev);
-        dequantize(cw, prev, &z[(size_t)f * 256]);
-        frame_ms[f] = (float)(secs(a, Clock::now()) * 1e3);
+        auto b = Clock::now();
+        dequantize(cw, prev, z);
+        decode_frame(cw, cs, z, audio);
+        auto c = Clock::now();
+        tok += secs(a, b);
+        codec += secs(b, c);
+        frame_ms[f] = (float)(secs(a, c) * 1e3);
     }
-    auto t1 = Clock::now();
-    const std::vector<float> audio = inverse_stft(decode(cw, z.data(), frames));
     auto t2 = Clock::now();
-    const double tok_ms = secs(t0, t1) * 1e3 / frames, codec_ms = secs(t1, t2) * 1e3 / frames;
+    const double tok_ms = tok * 1e3 / frames, codec_ms = codec * 1e3 / frames;
 
     std::vector<float> sorted = frame_ms;
     std::sort(sorted.begin(), sorted.end());
-    std::printf("\n=== the run: %d frames (%.1f s of audio), 1 thread ===\n", frames, frames * 0.04);
-    std::printf("tokens (encoder+temporal+depth): %6.1f ms/frame  (p50 %.1f, p99 %.1f, max %.1f)\n", tok_ms,
-                sorted[frames / 2], sorted[std::min(frames - 1, frames * 99 / 100)], sorted.back());
-    std::printf("codec (offline, whole clip):     %6.1f ms/frame\n", codec_ms);
-    std::printf("total: %.1f ms per 40 ms frame -> %.2fx real time\n", tok_ms + codec_ms, 40.0 / (tok_ms + codec_ms));
+    std::printf("\n=== the run: %d frames (%.1f s of audio), %d threads, %s transformer weights ===\n", frames,
+                frames * 0.04, threads, int8 ? "int8" : "float32");
+    std::printf("tokens (encoder+temporal+depth): %6.1f ms/frame\n", tok_ms);
+    std::printf("codec (streaming):               %6.1f ms/frame\n", codec_ms);
+    std::printf("total: %.1f ms per 40 ms frame -> %.2fx real time  (frame p50 %.1f, p99 %.1f, max %.1f ms)\n",
+                tok_ms + codec_ms, 40.0 / (tok_ms + codec_ms), sorted[frames / 2],
+                sorted[std::min(frames - 1, frames * 99 / 100)], sorted.back());
 
     // ---- the roofline table ----
     std::vector<prof::Entry> es = prof::entries();
     std::sort(es.begin(), es.end(), [](const prof::Entry &a, const prof::Entry &b) { return a.seconds > b.seconds; });
     double total = 0;
     for (const auto &e2 : es) total += e2.seconds;
-    std::printf("\n=== where the time goes (sorted; limits are for 1 core) ===\n");
+    std::printf("\n=== where the time goes (sorted; limits are for the %d threads used) ===\n", threads);
     std::printf("%-8s %-10s %8s %6s %6s %8s %7s %7s %-7s %7s\n", "stage", "op", "ms/frame", "share", "cum.",
                 "GFLOP/s", "GB/s", "flop/B", "limit", "% limit");
     double cum = 0;
@@ -211,13 +240,13 @@ int main(int argc, char **argv) {
         cum += e2.seconds;
         const double gf = e2.flops / e2.seconds / 1e9, gb = e2.bytes / e2.seconds / 1e9;
         const double ai = e2.flops / e2.bytes;
-        const bool mem = ai < P / W1;
-        const double roof = mem ? ai * W1 : P;
+        const bool mem = ai < Plim / Wlim;
+        const double roof = mem ? ai * Wlim : Plim;
         std::printf("%-8s %-10s %8.2f %5.1f%% %5.1f%% %8.1f %7.1f %7.2f %-7s %6.0f%%\n", e2.stage, e2.op,
                     e2.seconds * 1e3 / frames, 100 * e2.seconds / total, 100 * cum / total, gf, gb, ai,
                     mem ? "memory" : "compute", 100 * gf / roof);
     }
     const double wall = secs(t0, t2);
     std::printf("profiled operations cover %.1f%% of the wall time\n", 100 * total / wall);
-    return audio.empty() ? 1 : 0;
+    return 0;
 }

@@ -7,10 +7,10 @@ STD = -std=c++20
 # Shared code, named once. Headers are listed as prerequisites so that
 # editing one rebuilds what uses it; $(filter %.cpp,$^) then passes only
 # the .cpp files to the compiler.
-CORE       = weights.cpp safetensors.cpp json.cpp mmap.cpp profile.cpp \
-             weights.h safetensors.h json.h mmap.h profile.h
-MODEL_SRC  = ops.cpp ops.h blocks.cpp blocks.h encoder.cpp encoder.h temporal.cpp temporal.h \
-             depth.cpp depth.h conv.cpp conv.h codec.cpp codec.h
+CORE       = weights.cpp safetensors.cpp json.cpp mmap.cpp profile.cpp threads.cpp \
+             weights.h safetensors.h json.h mmap.h profile.h threads.h
+MODEL_SRC  = ops.cpp ops.h quant.cpp quant.h blocks.cpp blocks.h encoder.cpp encoder.h \
+             temporal.cpp temporal.h depth.cpp depth.h conv.cpp conv.h codec.cpp codec.h
 BUILD      = $(CXX) $(STD) $(CXXFLAGS) -o $@ $(filter %.cpp,$^)
 
 all: mrt2 mrt2dump mrt2info
@@ -34,7 +34,8 @@ tests/test_weights: tests/test_weights.cpp $(CORE)
 tests/test_ops: tests/test_ops.cpp tests/test.h ops.cpp ops.h $(CORE)
 	$(BUILD)
 
-tests/test_conv: tests/test_conv.cpp tests/test.h conv.cpp conv.h ops.cpp ops.h profile.cpp profile.h
+tests/test_conv: tests/test_conv.cpp tests/test.h conv.cpp conv.h ops.cpp ops.h profile.cpp profile.h \
+                 threads.cpp threads.h
 	$(BUILD)
 
 tests/test_encoder: tests/test_encoder.cpp tests/test.h $(MODEL_SRC) $(CORE)
@@ -47,6 +48,12 @@ tests/test_depth: tests/test_depth.cpp tests/test.h $(MODEL_SRC) $(CORE)
 	$(BUILD)
 
 tests/test_codec: tests/test_codec.cpp tests/test.h $(MODEL_SRC) $(CORE)
+	$(BUILD)
+
+tests/test_threads: tests/test_threads.cpp tests/test.h $(MODEL_SRC) $(CORE)
+	$(BUILD)
+
+tests/test_quant: tests/test_quant.cpp tests/test.h $(MODEL_SRC) $(CORE)
 	$(BUILD)
 
 # Speed spike (measurement tool, not the engine): built the way release
@@ -73,7 +80,8 @@ MODEL ?= $(HOME)/models/magenta-rt-v2/checkpoints/mrt2_small.safetensors
 REF   ?= $(HOME)/models/magenta-rt-v2/ref/ref_small.safetensors
 UNIT_TESTS = tests/test_conv
 FILE_TESTS = tests/test_mmap tests/test_weights
-REF_TESTS  = tests/test_ops tests/test_encoder tests/test_temporal tests/test_depth tests/test_codec
+REF_TESTS  = tests/test_ops tests/test_encoder tests/test_temporal tests/test_depth tests/test_codec \
+             tests/test_threads tests/test_quant
 TESTS      = $(UNIT_TESTS) $(FILE_TESTS) $(REF_TESTS)
 
 # Build every test, then run each one; make stops at the first failure.

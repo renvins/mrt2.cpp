@@ -22,6 +22,14 @@ TemporalWeights load_temporal(const Weights &w) {
     return tw;
 }
 
+void make_int8(TemporalWeights &tw) {
+    for (auto &L : tw.layer) {
+        make_int8(L.self, kModel, true);
+        make_int8(L.cross, 256, false);
+        make_int8(L.ffn);
+    }
+}
+
 TemporalState::TemporalState()
     : self_k((size_t)kTemporalLayers * kSlots * kModel), self_v(self_k.size()),
       cross_k(self_k.size()), cross_v(self_k.size()) {}

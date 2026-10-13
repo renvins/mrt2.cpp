@@ -49,7 +49,11 @@ Tensor conv2d_ref(const Tensor &x, const Conv &c, int pl, int pr);
 Tensor conv_transpose2d_ref(const Tensor &x, const Conv &c, int st, int sf);
 
 // Fast versions (need c.pack()). `label` names the layer in the profiler.
-Tensor conv2d(const Tensor &x, const Conv &c, int pl, int pr, const char *label = "conv");
-Tensor conv_transpose2d(const Tensor &x, const Conv &c, int st, int sf, const char *label = "convT");
+// `skip`: don't compute the first `skip` output time steps; the result
+// starts at step `skip` (for streaming, where the first input rows are
+// only the remembered past). For the transposed conv, a multiple of st.
+Tensor conv2d(const Tensor &x, const Conv &c, int pl, int pr, const char *label = "conv", int skip = 0);
+Tensor conv_transpose2d(const Tensor &x, const Conv &c, int st, int sf, const char *label = "convT",
+                        int skip = 0);
 
 } // namespace mrt2

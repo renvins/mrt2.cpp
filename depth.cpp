@@ -29,6 +29,19 @@ DepthWeights load_depth(const Weights &w) {
     return dw;
 }
 
+void make_int8(DepthWeights &dw) {
+    for (auto &L : dw.layer) {
+        make_int8(L.self, kDepthModel, true);
+        make_int8(L.ffn);
+    }
+    dw.q8_adapter = QMatrix();
+    q8_append_kernel(dw.q8_adapter, dw.adapter, kModel, kDepthModel, 0, kDepthModel);
+    for (int k = 0; k < kLevels; k++) {
+        dw.q8_logits[k] = QMatrix();
+        q8_append_kernel(dw.q8_logits[k], dw.logits_w, kDepthModel, kVocab, kReserved + k * kCodebook, kCodebook);
+    }
+}
+
 int sample_code(float logits[kCodebook], const Sampling &s, Rng &rng) {
     MRT2_PROF("sample", 8.0 * kCodebook, 4.0 * kCodebook);
     // The soft-cap never changes which logit is largest (greedy picks the
@@ -49,8 +62,10 @@ void depth_frame(const DepthWeights &dw, DepthState &st, const float t[kModel], 
         // adapter: 1024 -> 768
         float x[kDepthModel];
         {
-            MRT2_PROF("adapter", 2.0 * kModel * kDepthModel, 4.0 * kModel * kDepthModel);
-            vecmat(input, kModel, dw.adapter, kDepthModel, kDepthModel, nullptr, x);
+            const double n = (double)kModel * kDepthModel;
+            MRT2_PROF("adapter", 2 * n, dw.q8_adapter.rows ? q8_bytes(n) : 4 * n);
+            if (dw.q8_adapter.rows) q8_matvec(dw.q8_adapter, input, nullptr, x);
+            else vecmat(input, kModel, dw.adapter, kDepthModel, kDepthModel, nullptr, x);
         }
         if (dbg && dbg->adapter) std::copy(x, x + kDepthModel, dbg->adapter + k * kDepthModel);
 
@@ -71,13 +86,16 @@ void depth_frame(const DepthWeights &dw, DepthState &st, const float t[kModel], 
         const size_t c0 = kReserved + (size_t)k * kCodebook;
         float logits[kCodebook];
         {
-            MRT2_PROF("logits", 2.0 * kDepthModel * kCodebook, 4.0 * kDepthModel * kCodebook);
-            vecmat(h, kDepthModel, &dw.logits_packed[(size_t)k * kDepthModel * kCodebook], kCodebook,
-                   kCodebook, dw.logits_b + c0, logits);
+            const double n = (double)kDepthModel * kCodebook;
+            MRT2_PROF("logits", 2 * n, dw.q8_logits[k].rows ? q8_bytes(n) : 4 * n);
+            if (dw.q8_logits[k].rows) q8_matvec(dw.q8_logits[k], h, dw.logits_b + c0, logits);
+            else vecmat(h, kDepthModel, &dw.logits_packed[(size_t)k * kDepthModel * kCodebook], kCodebook,
+                        kCodebook, dw.logits_b + c0, logits);
         }
         if (dbg && dbg->logits) std::copy(logits, logits + kCodebook, dbg->logits + k * kCodebook);
 
         tokens[k] = (int32_t)c0 + sample_code(logits, s, rng);
+        if (dbg && dbg->force) tokens[k] = dbg->force[k];
 
         // The next step's input: the chosen token, embedded and scaled.
         MRT2_PROF("embed", 1.0 * kModel, 8.0 * kModel);

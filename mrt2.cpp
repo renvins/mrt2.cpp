@@ -4,22 +4,25 @@
 //   mrt2 styles
 //
 // The pipeline, once per 40 ms frame: conditioning -> encoder -> temporal
-// decoder -> depth decoder (12 tokens) -> codebook vectors; then the codec
-// turns all frames into stereo 48 kHz audio.
+// decoder -> depth decoder (12 tokens) -> codebook vector -> streaming
+// codec -> 1920 stereo samples at 48 kHz. Nothing is held back, so any
+// length works.
 //
-// Phase A version: plain single-threaded code and an offline codec (the
-// whole clip at once), so it is slower than real time and clips are
-// capped at 30 s. The speed phase makes it real time and streaming.
+// The transformer runs with int8 weights by default (quant.h; --fp32 for
+// exact float32).
 #include "codec.h"
 #include "depth.h"
 #include "encoder.h"
 #include "temporal.h"
+#include "threads.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace mrt2;
@@ -50,11 +53,13 @@ static void usage() {
                  "                         (default ~/models/magenta-rt-v2/checkpoints/mrt2_small.safetensors)\n"
                  "  --style NAME           a preset from `mrt2 styles` (default jazz)\n"
                  "  --style-tokens A,B,..  12 MusicCoCa tokens 0..1023 (instead of --style)\n"
-                 "  -s, --seconds N        length, 1..30 (default 10)\n"
+                 "  -s, --seconds N        length, 1..3600 (default 10)\n"
                  "  --temperature T        sampling temperature, 0 = greedy (default 1.3)\n"
                  "  --top-k K              sample among the K best tokens (default 40)\n"
                  "  --seed N               random seed: same seed, same music (default 0)\n"
                  "  --cfg-style X          how strongly to follow the style, -1..7 (default 3)\n"
+                 "  -t, --threads N        CPU threads to use (default: all)\n"
+                 "  --fp32                 float32 transformer weights (exact, slower; default int8)\n"
                  "  -o, --out PATH         output .wav (stereo, 48 kHz, 16-bit)\n");
 }
 
@@ -75,6 +80,8 @@ static int generate(int argc, char **argv) {
     double seconds = 10;
     Sampling sampling; // temperature 1.3, top-k 40
     uint64_t seed = 0;
+    int threads = (int)std::thread::hardware_concurrency();
+    bool int8 = true;
     Conditioning cond;
 
     for (int i = 2; i < argc; i++) {
@@ -90,6 +97,8 @@ static int generate(int argc, char **argv) {
         else if (a == "--top-k") sampling.top_k = std::atoi(value());
         else if (a == "--seed") seed = std::strtoull(value(), nullptr, 10);
         else if (a == "--cfg-style") cond.cfg_musiccoca = std::atof(value());
+        else if (a == "-t" || a == "--threads") threads = std::atoi(value());
+        else if (a == "--fp32") int8 = false;
         else if (a == "--style") {
             const std::string name = value();
             preset = nullptr;
@@ -108,8 +117,11 @@ static int generate(int argc, char **argv) {
         } else throw std::runtime_error("unknown option " + a);
     }
     if (out.empty()) throw std::runtime_error("missing -o out.wav");
-    if (seconds < 1 || seconds > 30) throw std::runtime_error("--seconds must be 1..30 for now (offline codec)");
+    if (seconds < 1 || seconds > 3600) throw std::runtime_error("--seconds must be 1..3600");
     if (sampling.top_k < 1 || sampling.top_k > (int)kMaxTopK) throw std::runtime_error("--top-k must be 1..256");
+    if (threads < 1) throw std::runtime_error("--threads must be >= 1");
+    prefer_performance_cores();
+    set_threads(threads);
     for (int k = 0; k < 12; k++) cond.style[k] = custom.empty() ? preset->tokens[k] : custom[k];
 
     int32_t tokens[kCondTokens];
@@ -121,13 +133,17 @@ static int generate(int argc, char **argv) {
     std::string err;
     if (!w.open(model, err)) throw std::runtime_error(err);
     const EncoderWeights ew = load_encoder(w);
-    const TemporalWeights tw = load_temporal(w);
-    const DepthWeights dw = load_depth(w);
+    TemporalWeights tw = load_temporal(w);
+    DepthWeights dw = load_depth(w);
     const CodecWeights cw = load_codec(w);
+    if (int8) {
+        make_int8(tw);
+        make_int8(dw);
+    }
     std::printf("model loaded in %.0f ms\n", ms_since(t0));
-    std::printf("style: %s | %.0f s | temperature %.2f | top-k %d | seed %llu\n",
+    std::printf("style: %s | %.0f s | temperature %.2f | top-k %d | seed %llu | %d threads | %s\n",
                 custom.empty() ? preset->prompt : "custom tokens", seconds, sampling.temperature, sampling.top_k,
-                (unsigned long long)seed);
+                (unsigned long long)seed, threads, int8 ? "int8" : "float32");
 
     // The conditioning is the same for every frame here, so encode it once.
     float e[256];
@@ -136,35 +152,38 @@ static int generate(int argc, char **argv) {
     const int frames = (int)(seconds * 25 + 0.5);
     TemporalState ts;
     DepthState ds;
+    CodecStream cs;
     Rng rng(seed);
-    std::vector<float> z((size_t)frames * 256);
+    std::vector<int16_t> pcm((size_t)frames * kSamplesPerFrame * 2);
     int32_t prev[kLevels] = {}; // the first frame starts from SOS (all 0)
-    float x[kModel], t[kModel];
-    auto t1 = std::chrono::steady_clock::now();
+    float x[kModel], t[kModel], z[256], audio[2 * kSamplesPerFrame];
+    double t_tokens = 0, t_codec = 0, worst = 0;
     for (int f = 0; f < frames; f++) {
+        auto a = std::chrono::steady_clock::now();
         temporal_input(tw, prev, x);
         temporal_step(tw, ts, x, e, t);
         depth_frame(dw, ds, t, sampling, rng, prev); // becomes the next frame's input
-        dequantize(cw, prev, &z[(size_t)f * 256]);
+        const double ms_tok = ms_since(a);
+        auto b = std::chrono::steady_clock::now();
+        dequantize(cw, prev, z);
+        decode_frame(cw, cs, z, audio);
+        const double ms_codec = ms_since(b);
+        for (int i = 0; i < 2 * kSamplesPerFrame; i++) pcm[(size_t)f * 2 * kSamplesPerFrame + i] = to_int16(audio[i]);
+        t_tokens += ms_tok;
+        t_codec += ms_codec;
+        worst = std::max(worst, ms_tok + ms_codec);
         if ((f + 1) % 25 == 0 || f + 1 == frames) {
-            std::printf("\rtokens: %3d / %d s", (f + 1) / 25, frames / 25);
+            std::printf("\r%3d / %d s", (f + 1) / 25, frames / 25);
             std::fflush(stdout);
         }
     }
-    const double t_tokens = ms_since(t1);
-    std::printf("  (%.1f ms per 40 ms frame)\ncodec...", t_tokens / frames);
-    std::fflush(stdout);
-
-    auto t2 = std::chrono::steady_clock::now();
-    const std::vector<float> audio = inverse_stft(decode(cw, z.data(), frames));
-    const double t_codec = ms_since(t2);
-    std::vector<int16_t> pcm(audio.size());
-    for (size_t i = 0; i < audio.size(); i++) pcm[i] = to_int16(audio[i]);
     if (!write_wav(out.c_str(), pcm, kSampleRate)) throw std::runtime_error("cannot write " + out);
 
     const double total = t_tokens + t_codec, audio_ms = frames * 40.0;
-    std::printf(" %.1f ms per frame\nwrote %s: %.1f s of audio in %.1f s (%.2fx real time)\n", t_codec / frames,
-                out.c_str(), audio_ms / 1000, total / 1000, audio_ms / total);
+    std::printf("\nper 40 ms frame: tokens %.1f ms + codec %.1f ms = %.1f ms (slowest frame %.1f ms)\n",
+                t_tokens / frames, t_codec / frames, total / frames, worst);
+    std::printf("wrote %s: %.1f s of audio in %.1f s (%.2fx real time)\n", out.c_str(), audio_ms / 1000,
+                total / 1000, audio_ms / total);
     return 0;
 }
 

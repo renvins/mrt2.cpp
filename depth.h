@@ -43,9 +43,15 @@ struct DepthWeights {
     // straight out of the 12294-wide matrix jumps 45 KB between rows,
     // which the memory prefetcher handles badly (measured: 34% of bandwidth).
     std::vector<float> logits_packed;
+    // int8 copies, empty unless make_int8() was called: the adapter, and
+    // each level's 1024 logit rows (bias kept in float32).
+    QMatrix q8_adapter, q8_logits[kLevels];
 };
 
 DepthWeights load_depth(const Weights &w);
+
+// Switch the decoder to int8 matrix products, as make_int8(TemporalWeights&).
+void make_int8(DepthWeights &dw);
 
 struct Sampling {
     float temperature = 1.3f;    // Google's defaults; 0 = greedy
@@ -57,6 +63,9 @@ struct DepthDebug {
     float *adapter = nullptr;    // [12][768] adapter output at each step
     float *final_ln = nullptr;   // [12][768] after the final LayerNorm
     float *logits = nullptr;     // [12][1024] each level's logits, before soft-cap
+    // Teacher forcing: use these 12 global ids instead of the sampled ones
+    // (they still go to `tokens`), so two runs see the same inputs.
+    const int32_t *force = nullptr;
 };
 
 // Choose one level's code from its 1024 logits the way Google does:

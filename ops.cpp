@@ -1,24 +1,59 @@
 #include "ops.h"
+#include "threads.h"
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 namespace mrt2 {
 
 // ---- matrix x vector ------------------------------------------------------
 
-void vecmat(const float *x, size_t in, const float *W, size_t ld, size_t cols,
-            const float *b, float *y) {
-    for (size_t j = 0; j < cols; j++) y[j] = b ? b[j] : 0.0f;
-    // Walk W one row at a time. Row i is contiguous in memory, so the
-    // weights are read front to back exactly once: the cache-friendly
-    // order for the [in][out] layout. Each row adds x[i] * row to y.
-    for (size_t i = 0; i < in; i++) {
+// y = sum over rows [r0, r1) of x[i] * W[i] (y is overwritten). Row i is
+// contiguous in memory, so the weights are read front to back exactly
+// once: the cache-friendly order for the [in][out] layout.
+static void vecmat_rows(const float *x, size_t r0, size_t r1, const float *W, size_t ld, size_t cols, float *y) {
+    for (size_t j = 0; j < cols; j++) y[j] = 0.0f;
+    for (size_t i = r0; i < r1; i++) {
         const float xi = x[i];
         const float *row = W + i * ld;
         for (size_t j = 0; j < cols; j++) y[j] += xi * row[j];
     }
+}
+
+// Big products are split into this many chunks of input rows, ALWAYS this
+// many, whatever the number of threads: each chunk sums its rows into a
+// partial result, and the partials are added in a fixed order. So the
+// rounding, and every output bit, is the same on 1 thread or 10.
+constexpr size_t kRowChunks = 16;
+
+void vecmat(const float *x, size_t in, const float *W, size_t ld, size_t cols,
+            const float *b, float *y) {
+    // Small products: one pass on this thread (waking workers costs more).
+    if (in < kRowChunks * 32 || in * cols < 128 * 1024) {
+        vecmat_rows(x, 0, in, W, ld, cols, y);
+        if (b) for (size_t j = 0; j < cols; j++) y[j] += b[j];
+        return;
+    }
+    // Partial results, one row of `cols` per chunk. Only the generation
+    // thread calls vecmat, so one buffer that only ever grows is enough.
+    static std::vector<float> partial;
+    if (partial.size() < kRowChunks * cols) partial.resize(kRowChunks * cols);
+    float *part = partial.data();
+    pool().run((int)kRowChunks, [&](int c) {
+        vecmat_rows(x, in * c / kRowChunks, in * (c + 1) / kRowChunks, W, ld, cols, part + (size_t)c * cols);
+    });
+    // y = b + partial[0] + partial[1] + ... in that order, split by columns.
+    const int parts = 8;
+    pool().run(parts, [&](int k) {
+        for (size_t j = cols * k / parts; j < cols * (k + 1) / parts; j++) {
+            float s = b ? b[j] : 0.0f;
+            for (size_t c = 0; c < kRowChunks; c++) s += part[c * cols + j];
+            y[j] = s;
+        }
+    });
 }
 
 float dot(const float *a, const float *b, size_t n) {
@@ -34,8 +69,12 @@ float dot(const float *a, const float *b, size_t n) {
 
 void matvec(const float *W, size_t rows, size_t in, const float *x, float *y) {
     // [rows][in] layout: each output is a dot product of one contiguous
-    // row of W with x, so again W is read front to back once.
-    for (size_t r = 0; r < rows; r++) y[r] = dot(W + r * in, x, in);
+    // row of W with x, so again W is read front to back once. Each output
+    // is computed whole by one thread: the same bits for any thread count.
+    const int chunks = rows * in < 128 * 1024 ? 1 : 16;
+    pool().run(chunks, [&](int c) {
+        for (size_t r = rows * c / chunks; r < rows * (c + 1) / chunks; r++) y[r] = dot(W + r * in, x, in);
+    });
 }
 
 // ---- normalization --------------------------------------------------------
@@ -99,17 +138,23 @@ void gelu_tanh(float *x, size_t n) {
     }
 }
 
-void elu(float *x, size_t n) {
+static void elu_range(float *x, size_t i0, size_t i1) {
     // x > 0: x. Otherwise exp(x) - 1, except near 0 where that subtraction
     // would lose digits (exp(x) ~ 1): there the series of expm1 is used,
     // x + x^2/2 + ... + x^8/8!, exact to float precision for |x| < 0.35.
     // Every branch is a select, so the loop vectorizes.
-    for (size_t i = 0; i < n; i++) {
+    for (size_t i = i0; i < i1; i++) {
         const float v = x[i];
         const float series = v * (1.0f + v * (0.5f + v * (1.0f / 6 + v * (1.0f / 24 + v * (1.0f / 120 + v * (1.0f / 720 + v * (1.0f / 5040 + v * (1.0f / 40320))))))));
         const float neg = v > -0.35f ? series : fast_exp(v) - 1.0f;
         x[i] = v > 0.0f ? v : neg;
     }
+}
+
+void elu(float *x, size_t n) {
+    // Element-wise, so any split gives the same bits.
+    const int chunks = n < 64 * 1024 ? 1 : 32;
+    pool().run(chunks, [&](int c) { elu_range(x, n * c / chunks, n * (c + 1) / chunks); });
 }
 
 void softcap(float *x, size_t n, float cap) {

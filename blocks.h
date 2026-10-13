@@ -16,6 +16,7 @@
 // model has no positional encoding, so the order of the slots does not
 // matter: only that slots [0, n) are the valid ones.
 #pragma once
+#include "quant.h"
 #include "weights.h"
 #include <string>
 
@@ -35,6 +36,10 @@ struct AttentionWeights {
     const float *wo;            // [model][heads * 128]  ([out][in] layout)
     const float *post_norm;     // [model]
     float q_scale[kHeadDim];    // computed at load time from per_dim_scale
+    // int8 copies, empty unless make_int8() was called. Self-attention
+    // fuses q, k and v into q8_in (one product, rows q|k|v); cross-attention
+    // projects k and v from another input, so they go to q8_kv.
+    QMatrix q8_in, q8_kv, q8_o;
 };
 
 struct FFNWeights {
@@ -43,6 +48,7 @@ struct FFNWeights {
     const float *w1, *b1;       // [model][hidden], [hidden]
     const float *w2, *b2;       // [hidden][model], [model]
     const float *post_norm;     // [model]
+    QMatrix q8_w1, q8_w2;       // int8 copies, empty unless make_int8() was called
 };
 
 // Load one block from the tensors under `prefix` (ending in '/').
@@ -51,6 +57,11 @@ struct FFNWeights {
 AttentionWeights load_attention(const Weights &w, const std::string &prefix, int model, int kv_in,
                                 bool sink);
 FFNWeights load_ffn(const Weights &w, const std::string &prefix, int model, int hidden);
+
+// Build the int8 copies of the matrices (quant.h); from then on the blocks
+// use them. kv_in as in load_attention. The float32 weights stay available.
+void make_int8(AttentionWeights &a, int kv_in, bool self);
+void make_int8(FFNWeights &f);
 
 // x += post_norm(Wo * attention(pre_norm(x))).
 // The new key and value are projected from `src` (src_dim numbers), or
