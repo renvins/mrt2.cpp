@@ -1,8 +1,10 @@
 .venv/
 build/
 *.o
+/mrt2
 mrt2dump
 mrt2info
+*.wav
 *.safetensors
 *.gguf
 # compiled tests and tools (sources stay tracked)

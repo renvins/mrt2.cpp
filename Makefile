@@ -9,10 +9,15 @@ STD = -std=c++20
 # the .cpp files to the compiler.
 CORE       = weights.cpp safetensors.cpp json.cpp mmap.cpp \
              weights.h safetensors.h json.h mmap.h
-MODEL_SRC  = ops.cpp ops.h encoder.cpp encoder.h
+MODEL_SRC  = ops.cpp ops.h blocks.cpp blocks.h encoder.cpp encoder.h temporal.cpp temporal.h \
+             depth.cpp depth.h codec.cpp codec.h
 BUILD      = $(CXX) $(STD) $(CXXFLAGS) -o $@ $(filter %.cpp,$^)
 
-all: mrt2dump mrt2info
+all: mrt2 mrt2dump mrt2info
+
+# The program: generate music.
+mrt2: mrt2.cpp $(MODEL_SRC) $(CORE)
+	$(BUILD)
 
 mrt2dump: mrt2dump.cpp mmap.cpp mmap.h
 	$(BUILD)
@@ -32,6 +37,15 @@ tests/test_ops: tests/test_ops.cpp tests/test.h ops.cpp ops.h $(CORE)
 tests/test_encoder: tests/test_encoder.cpp tests/test.h $(MODEL_SRC) $(CORE)
 	$(BUILD)
 
+tests/test_temporal: tests/test_temporal.cpp tests/test.h $(MODEL_SRC) $(CORE)
+	$(BUILD)
+
+tests/test_depth: tests/test_depth.cpp tests/test.h $(MODEL_SRC) $(CORE)
+	$(BUILD)
+
+tests/test_codec: tests/test_codec.cpp tests/test.h $(MODEL_SRC) $(CORE)
+	$(BUILD)
+
 # Speed spike (measurement tool, not the engine): built the way release
 # code will be, fully optimized for this machine's CPU.
 NATIVE = $(if $(filter arm64 aarch64,$(shell uname -m)),-mcpu=native,-march=native)
@@ -47,7 +61,7 @@ spike: tools/spike_bench
 MODEL ?= $(HOME)/models/magenta-rt-v2/checkpoints/mrt2_small.safetensors
 REF   ?= $(HOME)/models/magenta-rt-v2/ref/ref_small.safetensors
 FILE_TESTS = tests/test_mmap tests/test_weights
-REF_TESTS  = tests/test_ops tests/test_encoder
+REF_TESTS  = tests/test_ops tests/test_encoder tests/test_temporal tests/test_depth tests/test_codec
 TESTS      = $(FILE_TESTS) $(REF_TESTS)
 
 # Build every test, then run each one; make stops at the first failure.
@@ -64,7 +78,7 @@ ref:
 	.venv/bin/python tools/check_spec.py "$(REF)" "$(MODEL)"
 
 clean:
-	rm -f mrt2dump mrt2info $(TESTS) tools/spike_bench
+	rm -f mrt2 mrt2dump mrt2info $(TESTS) tools/spike_bench
 	rm -rf *.dSYM tests/*.dSYM tools/*.dSYM
 
 .PHONY: all clean test ref spike
