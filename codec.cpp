@@ -19,6 +19,7 @@ static Conv load_conv(const Weights &w, const std::string &name, int kt, int kf,
     c.kf = kf;
     c.cin = cin;
     c.cout = cout;
+    c.pack(); // reorder once for the fast conv kernel (conv.h)
     return c;
 }
 
@@ -47,12 +48,6 @@ CodecWeights load_codec(const Weights &w) {
         B.sf = s.sf;
     }
     cw.out = load_conv(w, "output_layer/base_conv_last", 7, 7, 64, 2);
-    const Conv &o = cw.out;
-    cw.out_packed.resize((size_t)o.cout * o.kt * o.kf * o.cin);
-    for (int co = 0; co < o.cout; co++)
-        for (int k = 0; k < o.kt * o.kf; k++)
-            for (int ci = 0; ci < o.cin; ci++)
-                cw.out_packed[((size_t)co * o.kt * o.kf + k) * o.cin + ci] = o.k[((size_t)k * o.cin + ci) * o.cout + co];
     return cw;
 }
 
@@ -66,106 +61,9 @@ void dequantize(const CodecWeights &cw, const int32_t tokens[12], float z[256]) 
     }
 }
 
-// ---- convolutions -------------------------------------------------------------
+// ---- the decoder ------------------------------------------------------------------
 //
-// Both are written in "gather" form: each output position sums, over the
-// kernel taps, (input position the tap lands on) x (tap weights). The
-// innermost loop runs over output channels, contiguous in both the
-// weights and the output.
-
-// Regular conv, stride 1. Time: causal (kt - 1 zeros of past, none of
-// future). Frequency: `pl` zeros below, `pr` above.
-static Tensor conv2d(const Tensor &x, const Conv &c, int pl, int pr, const char *label) {
-    Tensor y(x.t, x.f + pl + pr - c.kf + 1, c.cout);
-    // cost: every output position x every tap x cin x cout; bytes: weights + activations
-    MRT2_PROF(label, 2.0 * y.t * y.f * c.kt * c.kf * c.cin * c.cout,
-              4.0 * ((double)c.kt * c.kf * c.cin * c.cout + x.v.size() + y.v.size()));
-    for (int t = 0; t < y.t; t++)
-        for (int f = 0; f < y.f; f++) {
-            float *out = y.at(t, f);
-            for (int o = 0; o < c.cout; o++) out[o] = c.b[o];
-            for (int kt = 0; kt < c.kt; kt++) {
-                const int ti = t + kt - (c.kt - 1);
-                if (ti < 0) continue; // before the start: zero padding
-                for (int kf = 0; kf < c.kf; kf++) {
-                    const int fi = f + kf - pl;
-                    if (fi < 0 || fi >= x.f) continue;
-                    const float *in = x.at(ti, fi);
-                    const float *w = c.k + (size_t)(kt * c.kf + kf) * c.cin * c.cout;
-                    for (int i = 0; i < c.cin; i++) {
-                        const float xv = in[i];
-                        const float *wr = w + (size_t)i * c.cout;
-                        for (int o = 0; o < c.cout; o++) out[o] += xv * wr[o];
-                    }
-                }
-            }
-        }
-    return y;
-}
-
-// The same conv for a layer with very few output channels (the output
-// layer: 64 -> 2). Instead of vectorizing over 2 outputs (impossible),
-// each output is one long dot product over taps x input channels, using
-// weights packed as [cout][kt][kf][cin].
-static Tensor conv2d_few_out(const Tensor &x, const Conv &c, const float *packed, int pl, int pr,
-                             const char *label) {
-    Tensor y(x.t, x.f + pl + pr - c.kf + 1, c.cout);
-    MRT2_PROF(label, 2.0 * y.t * y.f * c.kt * c.kf * c.cin * c.cout,
-              4.0 * ((double)c.kt * c.kf * c.cin * c.cout + x.v.size() + y.v.size()));
-    for (int t = 0; t < y.t; t++)
-        for (int f = 0; f < y.f; f++)
-            for (int o = 0; o < c.cout; o++) {
-                float s = c.b[o];
-                for (int kt = 0; kt < c.kt; kt++) {
-                    const int ti = t + kt - (c.kt - 1);
-                    if (ti < 0) continue;
-                    for (int kf = 0; kf < c.kf; kf++) {
-                        const int fi = f + kf - pl;
-                        if (fi < 0 || fi >= x.f) continue;
-                        s += dot(x.at(ti, fi), packed + ((size_t)o * c.kt * c.kf + kt * c.kf + kf) * c.cin, c.cin);
-                    }
-                }
-                y.at(t, f)[o] = s;
-            }
-    return y;
-}
-
-// Transposed conv with stride (st, sf), as Google computes it: insert
-// st-1 / sf-1 zeros between input samples, pad (time: causal, freq:
-// "same"), then a regular correlation with the kernel (not flipped). Only
-// taps that land on a real (non-inserted) sample contribute, so we visit
-// just those: a tap at padded position p reads input p / stride, if
-// p is a multiple of the stride.
-static Tensor conv_transpose2d(const Tensor &x, const Conv &c, int st, int sf, const char *label) {
-    const int ptl = c.kt - 1;                        // time: causal
-    const int pa = c.kf + sf - 2;                    // freq: "same"
-    const int pfl = sf > c.kf - 1 ? c.kf - 1 : (pa + 1) / 2;
-    Tensor y(x.t * st, x.f * sf, c.cout);
-    // each output gets (kt/st) x (kf/sf) taps: the real work, no inserted zeros
-    MRT2_PROF(label, 2.0 * y.t * y.f * (c.kt / st) * (c.kf / sf) * c.cin * c.cout,
-              4.0 * ((double)c.kt * c.kf * c.cin * c.cout + x.v.size() + y.v.size()));
-    for (int t = 0; t < y.t; t++)
-        for (int f = 0; f < y.f; f++) {
-            float *out = y.at(t, f);
-            for (int o = 0; o < c.cout; o++) out[o] = c.b[o];
-            for (int kt = 0; kt < c.kt; kt++) {
-                const int pt = t + kt - ptl;
-                if (pt < 0 || pt % st || pt / st >= x.t) continue;
-                for (int kf = 0; kf < c.kf; kf++) {
-                    const int pf = f + kf - pfl;
-                    if (pf < 0 || pf % sf || pf / sf >= x.f) continue;
-                    const float *in = x.at(pt / st, pf / sf);
-                    const float *w = c.k + (size_t)(kt * c.kf + kf) * c.cin * c.cout;
-                    for (int i = 0; i < c.cin; i++) {
-                        const float xv = in[i];
-                        const float *wr = w + (size_t)i * c.cout;
-                        for (int o = 0; o < c.cout; o++) out[o] += xv * wr[o];
-                    }
-                }
-            }
-        }
-    return y;
-}
+// The convolutions themselves live in conv.h/.cpp.
 
 static Tensor elu_of(Tensor x) {
     MRT2_PROF("elu", (double)x.v.size(), 8.0 * x.v.size());
@@ -234,7 +132,7 @@ Tensor decode(const CodecWeights &cw, const float *z, int frames, CodecDebug *db
             h = block(h, cw.block[i], i);
             if (dbg) dbg->block[i - 1][g] = h;
         }
-        const Tensor o = conv2d_few_out(elu_of(h), cw.out, cw.out_packed.data(), 3, 3, "out.7x7"); // [4T][480][2]
+        const Tensor o = conv2d(elu_of(h), cw.out, 3, 3, "out.7x7"); // [4T][480][2]: real, imag
         for (int t = 0; t < o.t; t++)
             for (int f = 0; f < o.f; f++) {
                 spec.at(t, f)[2 * g] = o.at(t, f)[0];

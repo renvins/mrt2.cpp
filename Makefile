@@ -10,7 +10,7 @@ STD = -std=c++20
 CORE       = weights.cpp safetensors.cpp json.cpp mmap.cpp profile.cpp \
              weights.h safetensors.h json.h mmap.h profile.h
 MODEL_SRC  = ops.cpp ops.h blocks.cpp blocks.h encoder.cpp encoder.h temporal.cpp temporal.h \
-             depth.cpp depth.h codec.cpp codec.h
+             depth.cpp depth.h conv.cpp conv.h codec.cpp codec.h
 BUILD      = $(CXX) $(STD) $(CXXFLAGS) -o $@ $(filter %.cpp,$^)
 
 all: mrt2 mrt2dump mrt2info
@@ -32,6 +32,9 @@ tests/test_weights: tests/test_weights.cpp $(CORE)
 	$(BUILD)
 
 tests/test_ops: tests/test_ops.cpp tests/test.h ops.cpp ops.h $(CORE)
+	$(BUILD)
+
+tests/test_conv: tests/test_conv.cpp tests/test.h conv.cpp conv.h ops.cpp ops.h profile.cpp profile.h
 	$(BUILD)
 
 tests/test_encoder: tests/test_encoder.cpp tests/test.h $(MODEL_SRC) $(CORE)
@@ -68,13 +71,15 @@ bench: tools/bench
 # Override the paths with `make test MODEL=... REF=...`.
 MODEL ?= $(HOME)/models/magenta-rt-v2/checkpoints/mrt2_small.safetensors
 REF   ?= $(HOME)/models/magenta-rt-v2/ref/ref_small.safetensors
+UNIT_TESTS = tests/test_conv
 FILE_TESTS = tests/test_mmap tests/test_weights
 REF_TESTS  = tests/test_ops tests/test_encoder tests/test_temporal tests/test_depth tests/test_codec
-TESTS      = $(FILE_TESTS) $(REF_TESTS)
+TESTS      = $(UNIT_TESTS) $(FILE_TESTS) $(REF_TESTS)
 
 # Build every test, then run each one; make stops at the first failure.
 # Last, check that every weight in the model is a real number.
 test: $(TESTS) mrt2info
+	@for t in $(UNIT_TESTS); do echo "== $$t"; ./$$t || exit 1; done
 	@for t in $(FILE_TESTS); do echo "== $$t"; ./$$t "$(MODEL)" || exit 1; done
 	@for t in $(REF_TESTS); do echo "== $$t"; ./$$t "$(MODEL)" "$(REF)" || exit 1; done
 	@echo "== mrt2info --verify"; ./mrt2info --verify "$(MODEL)"

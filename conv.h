@@ -1,0 +1,55 @@
+// conv.h - the codec's 2D convolutions over (time, frequency, channel).
+//
+// Two versions of each:
+//   *_ref : plain loops, obviously correct; the reference for tests.
+//   fast  : the same results, 2-3x faster. Weights are "packed" once at
+//           load time so a register-blocked micro-kernel can compute a
+//           tile of 4 output positions x 16 output channels at a time:
+//           each weight loaded from memory then feeds 4 multiply-adds
+//           instead of 1 (the core idea of every fast conv/GEMM library).
+//
+// Both convs are written in "gather" form: every output position sums,
+// over the kernel taps, (the input position that tap reads) x (the tap's
+// weights). A regular conv is the special case stride 1 of the transposed
+// one, so one kernel serves both:
+//   conv2d            stride 1; time causal (kt-1 zeros of past); freq pads pl, pr
+//   conv_transpose2d  stride (st, sf), as Google computes it: zeros between
+//                     input samples, causal time / "same" freq padding,
+//                     kernel not flipped; only taps on real samples count.
+#pragma once
+#include <vector>
+
+namespace mrt2 {
+
+// Activations: [time][freq][channel], channels contiguous (like JAX).
+struct Tensor {
+    int t = 0, f = 0, c = 0;
+    std::vector<float> v;
+    Tensor() = default;
+    Tensor(int t_, int f_, int c_) : t(t_), f(f_), c(c_), v((size_t)t_ * f_ * c_, 0.0f) {}
+    float *at(int ti, int fi) { return v.data() + ((size_t)ti * f + fi) * c; }
+    const float *at(int ti, int fi) const { return v.data() + ((size_t)ti * f + fi) * c; }
+};
+
+// One convolution: kernel [kt][kf][cin][cout] (the checkpoint's layout,
+// read straight from the mapped file), bias [cout], and its packed copy.
+struct Conv {
+    const float *k = nullptr, *b = nullptr;
+    int kt = 0, kf = 0, cin = 0, cout = 0;
+    std::vector<float> packed;
+    // Fill `packed` (call once after setting the fields above):
+    //   cout a multiple of 16: [cout/16][kt*kf][cin][16] for the micro-kernel;
+    //   otherwise (the 2-channel output layer): [cout][kt*kf][cin], so each
+    //   output is one long dot product.
+    void pack();
+};
+
+// Reference versions: plain loops, for tests.
+Tensor conv2d_ref(const Tensor &x, const Conv &c, int pl, int pr);
+Tensor conv_transpose2d_ref(const Tensor &x, const Conv &c, int st, int sf);
+
+// Fast versions (need c.pack()). `label` names the layer in the profiler.
+Tensor conv2d(const Tensor &x, const Conv &c, int pl, int pr, const char *label = "conv");
+Tensor conv_transpose2d(const Tensor &x, const Conv &c, int st, int sf, const char *label = "convT");
+
+} // namespace mrt2

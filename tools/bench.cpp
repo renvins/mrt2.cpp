@@ -33,6 +33,9 @@
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
 
 using namespace mrt2;
 using Clock = std::chrono::steady_clock;
@@ -115,6 +118,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     const int frames = argc >= 3 ? std::atoi(argv[2]) : 50;
+#if defined(__APPLE__)
+    // Apple chips mix performance and efficiency cores, and macOS may run a
+    // thread started from a script on an efficiency core (~3x slower),
+    // making results swing between runs. "User-interactive" QoS asks for the
+    // performance cores, like a real-time audio engine will.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     const int hw = (int)std::thread::hardware_concurrency();
 
     std::printf("=== machine limits ===\n");

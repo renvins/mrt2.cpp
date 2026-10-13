@@ -26,6 +26,7 @@
 // This is the offline version (a whole clip at once, simple loops); the
 // real-time streaming version comes in the speed phase.
 #pragma once
+#include "conv.h"
 #include "weights.h"
 #include <cstdint>
 #include <vector>
@@ -34,23 +35,6 @@ namespace mrt2 {
 
 constexpr int kSamplesPerFrame = 1920; // 48000 Hz / 25 frames per second
 constexpr int kSampleRate = 48000;
-
-// Activations: [time][freq][channel], channels contiguous (like JAX).
-struct Tensor {
-    int t = 0, f = 0, c = 0;
-    std::vector<float> v;
-    Tensor() = default;
-    Tensor(int t_, int f_, int c_) : t(t_), f(f_), c(c_), v((size_t)t_ * f_ * c_, 0.0f) {}
-    float *at(int ti, int fi) { return v.data() + ((size_t)ti * f + fi) * c; }
-    const float *at(int ti, int fi) const { return v.data() + ((size_t)ti * f + fi) * c; }
-};
-
-// One convolution's weights: kernel [kt][kf][cin][cout] (the checkpoint's
-// layout) and bias [cout].
-struct Conv {
-    const float *k = nullptr, *b = nullptr;
-    int kt = 0, kf = 0, cin = 0, cout = 0;
-};
 
 struct CodecWeights {
     const float *codebooks;               // [64][1024][256]; levels 0..11 used
@@ -63,10 +47,6 @@ struct CodecWeights {
         int st, sf;                       // upsampling factors (time, freq)
     } block[7];                           // decoder_0 .. decoder_6
     Conv out;                             // output 7x7, 64 -> 2
-    // The output layer's kernel repacked at load time to [cout][kt][kf][cin]:
-    // with only 2 output channels, the vectorized loop has to run over the
-    // input channels instead, which must then be contiguous per tap.
-    std::vector<float> out_packed;
 };
 
 CodecWeights load_codec(const Weights &w);
