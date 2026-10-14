@@ -1,0 +1,165 @@
+# CI: build, test and benchmark mrt2.cpp on every platform we support.
+#
+#   test        5 platforms: CMake build, all tests (incl. parity with
+#               Google's numbers), benchmark + a 10 s generation
+#   sanitizers  Linux: the tests under ASan + UBSan, then ThreadSanitizer
+#   report      one table with every platform's speed, on the run's page
+#
+# The model (1.1 GB, Hugging Face) and the reference outputs (42 MB, this
+# repo's "test-data" release) are downloaded once, checked, and cached.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency: # a new push cancels the previous run of the same branch
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MODEL_URL: https://huggingface.co/google/magenta-realtime-2/resolve/main/checkpoints/mrt2_small.safetensors
+  MODEL_SHA256: 5dd1cbc7c606c512c21de0bcb04d4818bf0a3b873d7cbb9d1556d67d3b034de3
+  REF_URL: https://github.com/${{ github.repository }}/releases/download/test-data/ref_small.safetensors
+  REF_SHA256: a5a8b029e9219435eeac446f67e1a795d4c814a8679b4abe82679f503fc4031a
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false # one platform failing must not hide the others
+      matrix:
+        include:
+          - { name: Windows x64, os: windows-latest, id: windows-x64 }
+          - { name: Windows ARM64, os: windows-11-arm, id: windows-arm64 }
+          - { name: Linux x64, os: ubuntu-latest, id: linux-x64 }
+          - { name: Linux ARM64, os: ubuntu-24.04-arm, id: linux-arm64 }
+          - { name: macOS ARM64, os: macos-latest, id: macos-arm64 }
+    defaults:
+      run:
+        shell: bash # Git Bash on Windows: one script for every platform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q libasound2-dev
+
+      - name: Restore model and test data
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: mrt2-data-${{ env.MODEL_SHA256 }}-${{ env.REF_SHA256 }}
+
+      - name: Download model and test data
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p data
+          curl -fsSL --retry 3 -o data/mrt2_small.safetensors "$MODEL_URL"
+          curl -fsSL --retry 3 -o data/ref_small.safetensors "$REF_URL"
+
+      - name: Check fingerprints
+        run: |
+          sha() { if command -v sha256sum >/dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+          test "$(sha data/mrt2_small.safetensors)" = "$MODEL_SHA256" || { echo "model: wrong sha256"; exit 1; }
+          test "$(sha data/ref_small.safetensors)" = "$REF_SHA256" || { echo "test data: wrong sha256"; exit 1; }
+
+      - name: Configure
+        run: |
+          root="$PWD"
+          command -v cygpath >/dev/null && root="$(cygpath -m "$root")" # C:/... paths for CMake on Windows
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DMRT2_MODEL="$root/data/mrt2_small.safetensors" -DMRT2_REF="$root/data/ref_small.safetensors"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Benchmark
+        run: |
+          bin=build; [ -d build/Release ] && bin=build/Release # Visual Studio puts binaries in Release/
+          "$bin/bench" data/mrt2_small.safetensors 250 | tee bench.txt
+          "$bin/mrt2" generate -m data/mrt2_small.safetensors --style techno --seconds 10 -o out.wav \
+            | tr '\r' '\n' | tee generate.txt
+          {
+            echo "### ${{ matrix.name }}"
+            echo '```'
+            grep -E "^=== machine|^peak|^memory|^tokens|^codec|^total" bench.txt
+            grep -E "^per 40 ms|^wrote" generate.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.id }}
+          path: |
+            bench.txt
+            generate.txt
+
+  sanitizers:
+    name: Sanitizers (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update -q && sudo apt-get install -y -q libasound2-dev
+      - name: Restore model and test data
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: mrt2-data-${{ env.MODEL_SHA256 }}-${{ env.REF_SHA256 }}
+      - name: Download model and test data
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p data
+          curl -fsSL --retry 3 -o data/mrt2_small.safetensors "$MODEL_URL"
+          curl -fsSL --retry 3 -o data/ref_small.safetensors "$REF_URL"
+          echo "$MODEL_SHA256  data/mrt2_small.safetensors" | sha256sum -c
+          echo "$REF_SHA256  data/ref_small.safetensors" | sha256sum -c
+      - name: AddressSanitizer + UndefinedBehaviorSanitizer
+        run: make test MODEL=data/mrt2_small.safetensors REF=data/ref_small.safetensors
+               CXXFLAGS="-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all"
+      - name: ThreadSanitizer
+        run: |
+          # Newer kernels randomize memory addresses more than TSan supports.
+          sudo sysctl vm.mmap_rnd_bits=28
+          make clean
+          make test MODEL=data/mrt2_small.safetensors REF=data/ref_small.safetensors CXXFLAGS="-O1 -g -fsanitize=thread"
+
+  report:
+    name: Benchmark table
+    needs: test
+    if: always() # also when some platforms failed: show the ones that ran
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+      - name: Table
+        run: |
+          {
+            echo "## Speed per platform (GitHub's shared 4-core machines: expect run-to-run noise)"
+            echo
+            echo "| Platform | CPU | ms per 40 ms frame | real time | slowest frame (p99) | 10 s clip |"
+            echo "|---|---|---|---|---|---|"
+            for d in bench-*; do
+              [ -f "$d/bench.txt" ] || continue
+              cpu=$(sed -n 's/^=== machine: \(.*\), [0-9]* hardware threads.*/\1/p' "$d/bench.txt")
+              ms=$(sed -n 's/^total: \([0-9.]*\) ms per 40 ms frame.*/\1/p' "$d/bench.txt")
+              rt=$(sed -n 's/^total: .* -> \([0-9.]*x\) real time.*/\1/p' "$d/bench.txt")
+              p99=$(sed -n 's/.*p99 \([0-9.]*\),.*/\1/p' "$d/bench.txt")
+              clip=$(sed -n 's/^wrote .*(\([0-9.]*x\) real time)/\1/p' "$d/generate.txt")
+              echo "| ${d#bench-} | $cpu | $ms | $rt | $p99 ms | $clip |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -33,7 +33,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && !defined(_MSC_VER) // GCC-style inline asm below
 #include <arm_neon.h>
 #endif
 #if defined(__APPLE__)
@@ -88,7 +88,7 @@ static double peak_gflops() {
     volatile float va = 0.9999999f, vb = 1e-7f; // not compile-time constants
     const long iters = 40'000'000;
     volatile float sink = 0;
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) && !defined(_MSC_VER) // GCC-style inline asm below
     float32x4_t acc[16];
     for (int i = 0; i < 16; i++) acc[i] = vdupq_n_f32(1.0f + i);
     const float32x4_t a = vdupq_n_f32(va), b = vdupq_n_f32(vb);
