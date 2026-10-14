@@ -1,5 +1,12 @@
 #include "cpu.h"
 #include <cstdlib>
+#include <cstring>
+#if defined(MRT2_X86) && !(defined(_MSC_VER) && !defined(__clang__))
+#include <cpuid.h>
+#endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 namespace mrt2 {
 
@@ -32,6 +39,33 @@ bool cpu_avx2() {
     return yes;
 #else
     return false;
+#endif
+}
+
+std::string cpu_name() {
+#if defined(MRT2_X86)
+    // cpuid leaves 0x80000002..4 hold the 48-character brand string.
+    unsigned r[12] = {};
+    for (unsigned i = 0; i < 3; i++) {
+#if defined(_MSC_VER) && !defined(__clang__)
+        int v[4];
+        __cpuid(v, (int)(0x80000002u + i));
+        std::memcpy(r + 4 * i, v, 16);
+#else
+        __get_cpuid(0x80000002u + i, &r[4 * i], &r[4 * i + 1], &r[4 * i + 2], &r[4 * i + 3]);
+#endif
+    }
+    char s[49] = {};
+    std::memcpy(s, r, 48);
+    std::string name(s);
+    name.erase(0, name.find_first_not_of(' '));
+    return name;
+#elif defined(__APPLE__)
+    char s[128] = {};
+    size_t n = sizeof s - 1;
+    return sysctlbyname("machdep.cpu.brand_string", s, &n, nullptr, 0) == 0 ? std::string(s) : std::string();
+#else
+    return "";
 #endif
 }
 

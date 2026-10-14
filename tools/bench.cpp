@@ -18,6 +18,7 @@
 //
 // Built with -DMRT2_PROFILE. Usage:  tools/bench MODEL.safetensors [frames] [threads] [int8|fp32]
 #include "../codec.h"
+#include "../cpu.h"
 #include "../depth.h"
 #include "../encoder.h"
 #include "../profile.h"
@@ -55,7 +56,35 @@ static double secs(Clock::time_point a, Clock::time_point b) {
 // vectorized well enough by the compiler to measure the peak (17 GFLOP/s
 // instead of ~110). The empty asm statement hides the values from the
 // optimizer, so it can't simplify the loop away.
+#if defined(MRT2_X86)
+// The x86 version, with AVX2: 12 independent chains of 8-wide FMAs. An
+// x86 core has 2 FMA units with a 4-5 cycle latency, so it needs about 10
+// chains in flight to keep both busy.
+MRT2_AVX2 static double peak_gflops_avx2() {
+    volatile float va = 0.9999999f, vb = 1e-7f; // not compile-time constants
+    const long iters = 40'000'000;
+    volatile float sink = 0;
+    __m256 acc[12];
+    for (int i = 0; i < 12; i++) acc[i] = _mm256_set1_ps(1.0f + i);
+    const __m256 a = _mm256_set1_ps(va), b = _mm256_set1_ps(vb);
+    auto t0 = Clock::now();
+    for (long it = 0; it < iters; it++)
+        for (int i = 0; i < 12; i++) acc[i] = _mm256_fmadd_ps(acc[i], a, b);
+    __m256 t = acc[0];
+    for (int i = 1; i < 12; i++) t = _mm256_add_ps(t, acc[i]);
+    float lanes[8];
+    _mm256_storeu_ps(lanes, t);
+    sink = lanes[0] + lanes[7]; // stored before the clock is read again
+    const double s = secs(t0, Clock::now());
+    (void)sink;
+    return 2.0 * 8 * 12 * iters / s / 1e9;
+}
+#endif
+
 static double peak_gflops() {
+#if defined(MRT2_X86)
+    if (cpu_avx2()) return peak_gflops_avx2();
+#endif
     volatile float va = 0.9999999f, vb = 1e-7f; // not compile-time constants
     const long iters = 40'000'000;
     volatile float sink = 0;
@@ -129,6 +158,8 @@ int main(int argc, char **argv) {
     // the engine itself does.
     prefer_performance_cores();
 
+    std::printf("=== machine: %s, %d hardware threads%s ===\n", cpu_name().empty() ? "unknown CPU" : cpu_name().c_str(),
+                hw0, cpu_avx2() ? ", AVX2 kernels" : "");
     std::printf("=== machine limits ===\n");
     // Best of 5: the first runs can catch the core still raising its clock
     // speed (or briefly on an efficiency core); a limit is the best it can do.

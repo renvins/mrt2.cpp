@@ -8,6 +8,7 @@
 //
 // On ARM nothing is checked: NEON is always there on 64-bit ARM.
 #pragma once
+#include <string>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #define MRT2_X86 1
@@ -26,5 +27,9 @@ namespace mrt2 {
 // Set MRT2_NO_AVX2=1 in the environment to force the plain C++ kernels
 // (for tests: both paths must give the same results).
 bool cpu_avx2();
+
+// The processor's name ("AMD EPYC 7763 64-Core Processor", "Apple M4"),
+// for benchmark reports; "" if unknown.
+std::string cpu_name();
 
 } // namespace mrt2
