@@ -57,6 +57,16 @@ CodecWeights load_codec(const Weights &w) {
     return cw;
 }
 
+void make_fp16(CodecWeights &cw) {
+    for (Conv *c : {&cw.in_first, &cw.in_b1, &cw.in_b2, &cw.res_a, &cw.res_b}) c->pack_half();
+    for (int i = 0; i <= 1; i++) {
+        CodecWeights::Block &B = cw.block[i];
+        B.up.pack_half();
+        B.conv.pack_half();
+        if (B.shortcut.k) B.shortcut.pack_half();
+    }
+}
+
 void dequantize(const CodecWeights &cw, const int32_t tokens[12], float z[256]) {
     // Token id 6 + level * 1024 + code -> code; then one vector per level.
     for (int i = 0; i < 256; i++) z[i] = 0.0f;

@@ -55,6 +55,13 @@ struct CodecWeights {
 
 CodecWeights load_codec(const Weights &w);
 
+// Store the early layers' weights (input layer, input residual unit,
+// decoder_0, decoder_1: ~120 MB read every frame) as fp16, halving the
+// bytes they read. Measured on Google's 50 reference frames: 76 dB SNR vs
+// float32, at most a few int16 steps (inaudible). Without it: exact float32,
+// the mode the tests compare against Google's numbers.
+void make_fp16(CodecWeights &cw);
+
 // 12 global token ids -> z[256].
 void dequantize(const CodecWeights &cw, const int32_t tokens[12], float z[256]);
 

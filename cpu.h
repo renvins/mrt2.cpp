@@ -17,13 +17,14 @@
 #define MRT2_AVX2 // MSVC compiles AVX2 intrinsics anywhere; no attribute needed
 #else
 #include <immintrin.h>
-#define MRT2_AVX2 __attribute__((target("avx2,fma")))
+#define MRT2_AVX2 __attribute__((target("avx2,fma,f16c")))
 #endif
 #endif
 
 namespace mrt2 {
 
-// True if the AVX2 + FMA kernels can run here (always false off x86).
+// True if the AVX2 + FMA (+ F16C, for half-precision weights) kernels can
+// run here (always false off x86). Every AVX2 CPU has F16C; checked anyway.
 // Set MRT2_NO_AVX2=1 in the environment to force the plain C++ kernels
 // (for tests: both paths must give the same results).
 bool cpu_avx2();

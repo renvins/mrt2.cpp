@@ -17,6 +17,7 @@
 //                     input samples, causal time / "same" freq padding,
 //                     kernel not flipped; only taps on real samples count.
 #pragma once
+#include <cstdint>
 #include <vector>
 
 namespace mrt2 {
@@ -52,7 +53,19 @@ struct Conv {
     // an even number of output rows (with an even `skip`).
     std::vector<float> wino;
     void pack_winograd();
+
+    // Half-precision (fp16) copy of `packed`, same layout; when present it
+    // replaces `packed` (which is freed): the weights take half the bytes,
+    // which matters for layers limited by reading their weights. Needs cout
+    // a multiple of 16. See make_fp16() in codec.h.
+    std::vector<uint16_t> packed16;
+    void pack_half();
 };
+
+// float <-> fp16 (IEEE half: 1 sign, 5 exponent, 10 fraction bits), round
+// to nearest even. Plain C++: the same results on every compiler and CPU.
+uint16_t float_to_half(float x);
+float half_to_float(uint16_t h);
 
 // Reference versions: plain loops, for tests.
 Tensor conv2d_ref(const Tensor &x, const Conv &c, int pl, int pr);

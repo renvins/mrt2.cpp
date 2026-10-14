@@ -134,8 +134,64 @@ TEST(winograd_matches_reference) {
     CHECK(stream_same);
 }
 
+TEST(half_conversion_is_exact) {
+    // Every fp16 value survives float and back; and float -> fp16 picks the
+    // nearest fp16 (no neighbour is closer).
+    bool roundtrip = true;
+    for (uint32_t h = 0; h < 65536; h++) {
+        const float f = half_to_float((uint16_t)h);
+        if (std::isnan(f)) roundtrip &= std::isnan(half_to_float(float_to_half(f)));
+        else roundtrip &= float_to_half(f) == h;
+    }
+    Rng rng(3);
+    bool nearest = true;
+    for (int i = 0; i < 1000000; i++) {
+        // spread over fp16's range, both signs, including subnormals
+        const float x = (float)((rng.uniform() - 0.5) * std::pow(2.0, 34.0 * rng.uniform() - 24.0));
+        const uint16_t h = float_to_half(x);
+        const double err = std::fabs((double)x - half_to_float(h));
+        for (int d : {-1, 1}) {
+            const uint16_t n = (uint16_t)(h + d);
+            if ((n & 0x7C00) == 0x7C00 || (n & 0x8000) != (h & 0x8000)) continue; // inf/NaN or sign change
+            nearest &= err <= std::fabs((double)x - half_to_float(n));
+        }
+    }
+    std::printf("      all 65536 fp16 values round-trip: %s; 1M random floats round to the nearest fp16: %s\n",
+                roundtrip ? "yes" : "NO", nearest ? "yes" : "NO");
+    CHECK(roundtrip);
+    CHECK(nearest);
+}
+
+TEST(half_weights_kernel) {
+    // A conv with fp16 weights = the plain loops on the same rounded weights.
+    const Case cases[] = {{false, 3, 3, 32, 48, 4, 10, 1, 1}, {true, 4, 3, 32, 64, 3, 5, 2, 1}, {false, 1, 1, 64, 32, 2, 1, 0, 0}};
+    Rng rng(9);
+    double worst = 0;
+    for (const Case &cs : cases) {
+        Owned o = make_conv(cs, rng);
+        for (float &v : o.k) v = half_to_float(float_to_half(v)); // what fp16 storage keeps
+        o.c.pack();
+        Conv h = o.c;
+        h.pack_half();
+        Tensor x(cs.t, cs.f, cs.cin);
+        for (float &v : x.v) v = (float)rng.uniform() - 0.5f;
+        const Tensor want = cs.transposed ? conv_transpose2d_ref(x, o.c, cs.a, cs.b) : conv2d_ref(x, o.c, cs.a, cs.b);
+        const Tensor got = cs.transposed ? conv_transpose2d(x, h, cs.a, cs.b) : conv2d(x, h, cs.a, cs.b);
+        double err = 0, mag = 0;
+        for (size_t i = 0; i < want.v.size(); i++) {
+            err = std::max(err, (double)std::fabs(got.v[i] - want.v[i]));
+            mag = std::max(mag, (double)std::fabs(want.v[i]));
+        }
+        worst = std::max(worst, err / mag);
+    }
+    std::printf("      fp16-weight kernel vs plain loops on the same weights: worst relative error %.1e\n", worst);
+    CHECK(worst < 1e-5);
+}
+
 int main() {
     RUN(fast_matches_reference);
     RUN(winograd_matches_reference);
+    RUN(half_conversion_is_exact);
+    RUN(half_weights_kernel);
     return test::summary("test_conv");
 }

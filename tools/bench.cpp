@@ -232,10 +232,11 @@ int main(int argc, char **argv) {
     const EncoderWeights ew = load_encoder(w);
     TemporalWeights tw = load_temporal(w);
     DepthWeights dw = load_depth(w);
-    const CodecWeights cw = load_codec(w);
-    if (int8) {
+    CodecWeights cw = load_codec(w);
+    if (int8) { // the engine's default: int8 transformer, fp16 early codec layers
         make_int8(tw);
         make_int8(dw);
+        make_fp16(cw);
     }
 
     // Jazz preset, Google's default sampling: a realistic run.
@@ -288,8 +289,8 @@ int main(int argc, char **argv) {
 
     std::vector<float> sorted = frame_ms;
     std::sort(sorted.begin(), sorted.end());
-    std::printf("\n=== the run: %d frames (%.1f s of audio), %d threads, %s transformer weights ===\n", frames,
-                frames * 0.04, threads, int8 ? "int8" : "float32");
+    std::printf("\n=== the run: %d frames (%.1f s of audio), %d threads, %s weights ===\n", frames,
+                frames * 0.04, threads, int8 ? "int8 + fp16" : "float32");
     std::printf("tokens (encoder+temporal+depth): %6.1f ms/frame\n", tok_ms);
     std::printf("codec (streaming):               %6.1f ms/frame\n", codec_ms);
     std::printf("total: %.1f ms per 40 ms frame -> %.2fx real time  (frame p50 %.1f, p99 %.1f, max %.1f ms)\n",

@@ -5,6 +5,7 @@
 #include "threads.h"
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #if defined(__ARM_NEON) || defined(_M_ARM64) // _M_ARM64: Visual Studio's name for 64-bit ARM
 #include <arm_neon.h>
 #endif
@@ -110,6 +111,55 @@ void Conv::pack() {
     }
 }
 
+// ---- half precision ---------------------------------------------------------------
+
+uint16_t float_to_half(float x) {
+    uint32_t u;
+    std::memcpy(&u, &x, 4);
+    const uint32_t sign = (u >> 16) & 0x8000, mant = u & 0x7FFFFF;
+    const int exp = (int)((u >> 23) & 0xFF);
+    if (exp == 255) return (uint16_t)(sign | 0x7C00 | (mant ? 0x200 : 0)); // inf, NaN
+    const int e = exp - 127 + 15;                                       // fp16 exponent
+    if (e >= 31) return (uint16_t)(sign | 0x7C00);                      // too big: inf
+    if (e <= 0) {                                                       // subnormal or 0
+        if (e < -10) return (uint16_t)sign;
+        const uint32_t m = mant | 0x800000; // with the implicit leading 1
+        const int shift = 14 - e;
+        uint32_t h = m >> shift;
+        const uint32_t rest = m & ((1u << shift) - 1), half = 1u << (shift - 1);
+        if (rest > half || (rest == half && (h & 1))) h++; // round to nearest even
+        return (uint16_t)(sign | h);
+    }
+    uint32_t h = ((uint32_t)e << 10) | (mant >> 13);
+    const uint32_t rest = mant & 0x1FFF;
+    if (rest > 0x1000 || (rest == 0x1000 && (h & 1))) h++; // a carry may bump the exponent: still right
+    return (uint16_t)(sign | h);
+}
+
+float half_to_float(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000) << 16;
+    uint32_t e = (h >> 10) & 0x1F, m = h & 0x3FF, u;
+    if (e == 0) {
+        if (m == 0) u = sign;
+        else { // subnormal: shift the fraction up until its leading 1 is implicit
+            e = 113;
+            while (!(m & 0x400)) m <<= 1, e--;
+            u = sign | (e << 23) | ((m & 0x3FF) << 13);
+        }
+    } else if (e == 31) u = sign | 0x7F800000 | (m << 13); // inf, NaN
+    else u = sign | ((e + 112) << 23) | (m << 13);
+    float x;
+    std::memcpy(&x, &u, 4);
+    return x;
+}
+
+void Conv::pack_half() {
+    assert(cout % CT == 0 && !packed.empty());
+    packed16.resize(packed.size());
+    for (size_t i = 0; i < packed.size(); i++) packed16[i] = float_to_half(packed[i]);
+    std::vector<float>().swap(packed); // free the float32 copy
+}
+
 // ---- the micro-kernel -------------------------------------------------------------
 
 // The micro-kernels keep their 4 x 16 running sums in arrays indexed by
@@ -194,6 +244,78 @@ static inline void micro_4x16(const float *const x[P], const float *w, int cin, 
 #endif
 }
 
+// The same tile with half-precision weights: 16 halves are loaded and
+// converted to 16 floats (one instruction per 4 or 8), then the very same
+// multiply-adds. Used by the layers limited by reading their weights.
+#if defined(MRT2_X86)
+MRT2_AVX2 static void micro_4x16_avx2_h(const float *const x[P], const uint16_t *w, int cin, float acc[P][CT]) {
+    __m256 a[P][2];
+    MRT2_UNROLL
+    for (int p = 0; p < P; p++) {
+        a[p][0] = _mm256_loadu_ps(acc[p]);
+        a[p][1] = _mm256_loadu_ps(acc[p] + 8);
+    }
+    for (int ci = 0; ci < cin; ci++, w += CT) {
+        const __m256 w0 = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(w)));     // F16C
+        const __m256 w1 = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(w + 8)));
+        MRT2_UNROLL
+        for (int p = 0; p < P; p++) {
+            const __m256 xv = _mm256_broadcast_ss(x[p] + ci);
+            a[p][0] = _mm256_fmadd_ps(xv, w0, a[p][0]);
+            a[p][1] = _mm256_fmadd_ps(xv, w1, a[p][1]);
+        }
+    }
+    MRT2_UNROLL
+    for (int p = 0; p < P; p++) {
+        _mm256_storeu_ps(acc[p], a[p][0]);
+        _mm256_storeu_ps(acc[p] + 8, a[p][1]);
+    }
+}
+#endif
+
+static inline void micro_4x16(const float *const x[P], const uint16_t *w, int cin, float acc[P][CT]) {
+#if defined(__ARM_NEON) || defined(_M_ARM64)
+    float32x4_t a[P][4];
+    MRT2_UNROLL
+    for (int p = 0; p < P; p++)
+        MRT2_UNROLL
+        for (int j = 0; j < 4; j++) a[p][j] = vld1q_f32(acc[p] + 4 * j);
+    for (int ci = 0; ci < cin; ci++, w += CT) {
+        const uint16x8_t h0 = vld1q_u16(w), h1 = vld1q_u16(w + 8);
+        const float32x4_t w0 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(h0)));
+        const float32x4_t w1 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(h0)));
+        const float32x4_t w2 = vcvt_f32_f16(vreinterpret_f16_u16(vget_low_u16(h1)));
+        const float32x4_t w3 = vcvt_f32_f16(vreinterpret_f16_u16(vget_high_u16(h1)));
+        MRT2_UNROLL
+        for (int p = 0; p < P; p++) {
+            const float xv = x[p][ci];
+            a[p][0] = vfmaq_n_f32(a[p][0], w0, xv);
+            a[p][1] = vfmaq_n_f32(a[p][1], w1, xv);
+            a[p][2] = vfmaq_n_f32(a[p][2], w2, xv);
+            a[p][3] = vfmaq_n_f32(a[p][3], w3, xv);
+        }
+    }
+    MRT2_UNROLL
+    for (int p = 0; p < P; p++)
+        MRT2_UNROLL
+        for (int j = 0; j < 4; j++) vst1q_f32(acc[p] + 4 * j, a[p][j]);
+#else
+#if defined(MRT2_X86)
+    static const bool avx2 = cpu_avx2();
+    if (avx2) return micro_4x16_avx2_h(x, w, cin, acc);
+#endif
+    for (int ci = 0; ci < cin; ci++, w += CT) {
+        float wf[CT];
+        for (int j = 0; j < CT; j++) wf[j] = half_to_float(w[j]);
+        MRT2_UNROLL
+        for (int p = 0; p < P; p++) {
+            const float xv = x[p][ci];
+            for (int j = 0; j < CT; j++) acc[p][j] += xv * wf[j];
+        }
+    }
+#endif
+}
+
 // ---- few output channels: one long dot product per output ----------------------
 
 // sum over j < n of x[j] . w[tap[j]] (each a run of cin floats), with one set
@@ -274,7 +396,8 @@ static void conv_item(const Tensor &x, const Conv &c, const Geometry &g, Tensor 
     }
     const int c0 = tile * CT;
     float acc[P][CT] = {};
-    const float *wt = &c.packed[(size_t)tile * taps * c.cin * CT];
+    const bool half = !c.packed16.empty(); // fp16 weights (same layout) instead of float32
+    const size_t wt = (size_t)tile * taps * c.cin * CT;
     for (int kt = 0; kt < c.kt; kt++)
         for (int kf = 0; kf < c.kf; kf++) {
             const float *in[P];
@@ -285,7 +408,9 @@ static void conv_item(const Tensor &x, const Conv &c, const Geometry &g, Tensor 
                 if (!in[p]) in[p] = kZeros;
             }
             if (!any) continue; // this tap is padding for all 4
-            micro_4x16(in, wt + (size_t)(kt * c.kf + kf) * c.cin * CT, c.cin, acc);
+            const size_t at = wt + (size_t)(kt * c.kf + kf) * c.cin * CT;
+            if (half) micro_4x16(in, &c.packed16[at], c.cin, acc);
+            else micro_4x16(in, &c.packed[at], c.cin, acc);
         }
     for (int p = 0; p < np; p++) {
         float *out = y.at(t[p], f[p]) + c0;
@@ -294,7 +419,7 @@ static void conv_item(const Tensor &x, const Conv &c, const Geometry &g, Tensor 
 }
 
 static Tensor conv_core(const Tensor &x, const Conv &c, const Geometry &g) {
-    assert(c.cin <= 4096 && !c.packed.empty()); // kZeros size; pack() called
+    assert(c.cin <= 4096 && (!c.packed.empty() || !c.packed16.empty())); // kZeros size; pack() called
     Tensor y(g.to, g.fo, c.cout);
     const int taps = c.kt * c.kf;
     const int threads = pool().size();
@@ -495,7 +620,8 @@ Tensor conv2d(const Tensor &x, const Conv &c, int pl, int pr, const char *label,
     }
     const Geometry g = conv_geometry(x, c, pl, pr, skip);
     MRT2_PROF(label, 2.0 * g.to * g.fo * c.kt * c.kf * c.cin * c.cout,
-              4.0 * ((double)c.kt * c.kf * c.cin * c.cout + x.v.size() + (double)g.to * g.fo * c.cout));
+              (c.packed16.empty() ? 4.0 : 2.0) * c.kt * c.kf * c.cin * c.cout +
+                  4.0 * (x.v.size() + (double)g.to * g.fo * c.cout));
     return conv_core(x, c, g);
 }
 
@@ -503,7 +629,8 @@ Tensor conv_transpose2d(const Tensor &x, const Conv &c, int st, int sf, const ch
     const Geometry g = transpose_geometry(x, c, st, sf, skip);
     // each output gets (kt/st) x (kf/sf) real taps: no work on inserted zeros
     MRT2_PROF(label, 2.0 * g.to * g.fo * (c.kt / st) * (c.kf / sf) * c.cin * c.cout,
-              4.0 * ((double)c.kt * c.kf * c.cin * c.cout + x.v.size() + (double)g.to * g.fo * c.cout));
+              (c.packed16.empty() ? 4.0 : 2.0) * c.kt * c.kf * c.cin * c.cout +
+                  4.0 * (x.v.size() + (double)g.to * g.fo * c.cout));
     return conv_core(x, c, g);
 }
 

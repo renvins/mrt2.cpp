@@ -199,6 +199,35 @@ TEST(istft_fft_matches_direct_sum) {
     CHECK(err <= 1e-6 * mag);  // only float rounding of the result
 }
 
+TEST(fp16_early_layers_are_inaudible) {
+    // The fast mode's fp16 weights in the first codec layers, against exact
+    // float32, on Google's 50 frames. Measured: 76 dB SNR, at most 3 int16
+    // steps. Also: still the same bits streaming and offline.
+    const CodecWeights exact = load_codec(*W);
+    CodecWeights fast = load_codec(*W);
+    make_fp16(fast);
+    const float *z = R->f32("codec/z", {FRAMES, 256});
+    const std::vector<float> a = inverse_stft(decode(exact, z, FRAMES));
+    const std::vector<float> b = inverse_stft(decode(fast, z, FRAMES));
+    double sig = 0, noise = 0;
+    int maxdiff = 0;
+    for (size_t i = 0; i < a.size(); i++) {
+        sig += (double)a[i] * a[i];
+        noise += (double)(b[i] - a[i]) * (b[i] - a[i]);
+        maxdiff = std::max(maxdiff, std::abs((int)to_int16(b[i]) - (int)to_int16(a[i])));
+    }
+    std::vector<float> stream((size_t)FRAMES * kSamplesPerFrame * 2);
+    CodecStream st;
+    for (int f = 0; f < FRAMES; f++) decode_frame(fast, st, z + f * 256, &stream[(size_t)f * kSamplesPerFrame * 2]);
+    const bool same = std::memcmp(stream.data(), b.data(), b.size() * 4) == 0;
+    const double snr = 10 * std::log10(sig / noise);
+    std::printf("      fp16 vs float32: SNR %.1f dB, max %d int16 steps; streaming %s offline\n", snr, maxdiff,
+                same ? "bit-identical to" : "NOT identical to");
+    CHECK(snr >= 70.0);
+    CHECK(maxdiff <= 4);
+    CHECK(same);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         std::printf("usage: %s MODEL.safetensors REF.safetensors\n", argv[0]);
@@ -218,6 +247,7 @@ int main(int argc, char **argv) {
         RUN(decoder_blocks_match_google);
         RUN(audio_from_our_tokens_matches_google);
         RUN(streaming_equals_offline);
+        RUN(fp16_early_layers_are_inaudible);
     } catch (const std::runtime_error &e) { // a missing/mis-shaped tensor
         std::printf("    FAIL %s\n", e.what());
         test::failures++;

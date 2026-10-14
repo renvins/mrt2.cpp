@@ -60,10 +60,11 @@ static Result generate(float temperature, bool int8) {
     const EncoderWeights ew = load_encoder(*W);
     TemporalWeights tw = load_temporal(*W);
     DepthWeights dw = load_depth(*W);
-    const CodecWeights cw = load_codec(*W);
-    if (int8) {
+    CodecWeights cw = load_codec(*W);
+    if (int8) { // the fast mode: int8 transformer + fp16 early codec layers
         make_int8(tw);
         make_int8(dw);
+        make_fp16(cw);
     }
     Conditioning cond;
     const int jazz[12] = {555, 402, 72, 424, 482, 932, 954, 153, 33, 374, 519, 779};
@@ -105,7 +106,7 @@ TEST(same_music_on_any_thread_count) {
         const bool same_audio = one.audio.size() == many.audio.size() &&
                                 std::memcmp(one.audio.data(), many.audio.data(), one.audio.size() * 4) == 0;
         std::printf("      %s, temperature %.1f, 1 vs %d threads: tokens %s, audio %s\n",
-                    int8 ? "int8   " : "float32", temperature, hw,
+                    int8 ? "fast   " : "float32", temperature, hw,
                     same_tokens ? "identical" : "DIFFERENT", same_audio ? "bit-identical" : "DIFFERENT");
         CHECK(same_tokens);
         CHECK(same_audio);

@@ -27,15 +27,15 @@ static bool detect_avx2() {
     __cpuid(r, 0);
     if (r[0] < 7) return false;
     __cpuid(r, 1);
-    const bool fma = r[2] & (1 << 12), osxsave = r[2] & (1 << 27), avx = r[2] & (1 << 28);
-    if (!fma || !osxsave || !avx) return false;
+    const bool fma = r[2] & (1 << 12), osxsave = r[2] & (1 << 27), avx = r[2] & (1 << 28), f16c = r[2] & (1 << 29);
+    if (!fma || !osxsave || !avx || !f16c) return false;
     if ((_xgetbv(0) & 6) != 6) return false; // XMM and YMM state enabled by the OS
     __cpuidex(r, 7, 0);
     return r[1] & (1 << 5); // AVX2
 #else
     // The compiler's built-in does the same checks, OS support included.
     __builtin_cpu_init();
-    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
 #endif
 }
 #endif

@@ -9,8 +9,8 @@
 // codec -> 1920 stereo samples at 48 kHz. Nothing is held back, so any
 // length works.
 //
-// The transformer runs with int8 weights by default (quant.h; --fp32 for
-// exact float32).
+// By default the transformer runs with int8 weights (quant.h) and the
+// codec's first layers with fp16 weights; --fp32 for exact float32.
 #include "audio.h"
 #include "codec.h"
 #include "depth.h"
@@ -65,7 +65,8 @@ static void usage() {
                  "  --seed N               random seed: same seed, same music (default 0)\n"
                  "  --cfg-style X          how strongly to follow the style, -1..7 (default 3)\n"
                  "  -t, --threads N        CPU threads to use (default: all)\n"
-                 "  --fp32                 float32 transformer weights (exact, slower; default int8)\n"
+                 "  --fp32                 exact float32 weights everywhere (slower; default: int8\n"
+                 "                         transformer, fp16 for the codec's first layers)\n"
                  "  -o, --out PATH         output .wav (stereo, 48 kHz, 16-bit); for live, a recording\n"
                  "generate only:\n"
                  "  -s, --seconds N        length, 1..3600 (default 10)\n"
@@ -178,9 +179,10 @@ struct Engine {
         tw = load_temporal(w);
         dw = load_depth(w);
         cw = load_codec(w);
-        if (int8) {
+        if (int8) { // "fast": int8 transformer, fp16 early codec layers
             make_int8(tw);
             make_int8(dw);
+            make_fp16(cw);
         }
     }
 
@@ -227,7 +229,7 @@ static void start_engine(Engine &eng, const Options &o, const char *what) {
     std::printf("model loaded in %.0f ms\n", ms_since(t0));
     std::printf("%s | style: %s | temperature %.2f | top-k %d | seed %llu | %d threads | %s\n", what,
                 o.custom.empty() ? o.preset->prompt : "custom tokens", o.sampling.temperature, o.sampling.top_k,
-                (unsigned long long)o.seed, o.threads, o.int8 ? "int8" : "float32");
+                (unsigned long long)o.seed, o.threads, o.int8 ? "int8 + fp16" : "float32");
 }
 
 // ---- mrt2 generate --------------------------------------------------------------------
