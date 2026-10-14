@@ -42,6 +42,16 @@ struct Conv {
     //   otherwise (the 2-channel output layer): [cout][kt*kf][cin], so each
     //   output is one long dot product.
     void pack();
+
+    // Winograd form of a 3x3 conv's weights, [cout/16][16][cin][16]; empty
+    // unless pack_winograd() was called. When present, conv2d() computes
+    // this layer with Winograd F(2x2, 3x3) (see conv.cpp): 16 multiplies per
+    // 2x2 outputs instead of 36. A per-layer choice made at load time, so a
+    // layer is always computed the same way (offline and streaming give the
+    // same bits). Needs: 3x3, padding 1/1, cin and cout multiples of 16, and
+    // an even number of output rows (with an even `skip`).
+    std::vector<float> wino;
+    void pack_winograd();
 };
 
 // Reference versions: plain loops, for tests.

@@ -363,7 +363,136 @@ static Tensor conv_core(const Tensor &x, const Conv &c, const Geometry &g) {
     return y;
 }
 
+// ---- Winograd F(2x2, 3x3) ------------------------------------------------------------
+//
+// A 2x2 block of outputs needs a 4x4 patch d of inputs. With
+//   U = G g G^T   (the 3x3 weights g -> 4x4, once at load time)
+//   V = B^T d B   (the input patch -> 4x4, additions only)
+//   Y = A^T (U . V) A   (element-wise product, then 4x4 -> 2x2, additions only)
+// Y is exactly the 2x2 conv output (Lavin & Gray, arXiv 1509.09308), with
+//   G = [1 0 0; 1/2 1/2 1/2; 1/2 -1/2 1/2; 0 0 1]
+//   B^T = [1 0 -1 0; 0 1 1 0; 0 -1 1 0; 0 1 0 -1]
+//   A^T = [1 1 1 0; 0 1 -1 -1].
+// Summed over input channels, "U . V" is 16 independent matrix products
+// (one per position ij of the 4x4 grid): M[ij] = V[ij] (tiles x cin) times
+// U[ij] (cin x cout), done by the same micro-kernel as the direct conv.
+// 16 multiplies per 4 outputs instead of 36: 2.25x fewer.
+
+void Conv::pack_winograd() {
+    assert(kt == 3 && kf == 3 && cin % CT == 0 && cout % CT == 0);
+    wino.assign((size_t)16 * cin * cout, 0.0f);
+    const double G[4][3] = {{1, 0, 0}, {0.5, 0.5, 0.5}, {0.5, -0.5, 0.5}, {0, 0, 1}};
+    for (int ci = 0; ci < cin; ci++)
+        for (int co = 0; co < cout; co++) {
+            double g[3][3], t[4][3];
+            for (int a = 0; a < 3; a++)
+                for (int b = 0; b < 3; b++) g[a][b] = k[((size_t)(a * 3 + b) * cin + ci) * cout + co];
+            for (int i = 0; i < 4; i++) // t = G g
+                for (int b = 0; b < 3; b++) t[i][b] = G[i][0] * g[0][b] + G[i][1] * g[1][b] + G[i][2] * g[2][b];
+            for (int i = 0; i < 4; i++) // U = t G^T
+                for (int j = 0; j < 4; j++) {
+                    const double u = t[i][0] * G[j][0] + t[i][1] * G[j][1] + t[i][2] * G[j][2];
+                    wino[(((size_t)(co / CT) * 16 + i * 4 + j) * cin + ci) * CT + co % CT] = (float)u;
+                }
+        }
+}
+
+static Tensor conv_winograd(const Tensor &x, const Conv &c, int skip, const char *label) {
+    const int rows = x.t - skip, F = x.f, ci = c.cin, co = c.cout;
+    assert(rows % 2 == 0 && skip % 2 == 0);
+    const int tf = (F + 1) / 2, tiles = rows / 2 * tf; // 2x2 output tiles
+    // 16 multiplies per tile per (input, output) channel pair, + transforms
+    MRT2_PROF(label, 2.0 * 16 * tiles * ci * co, 4.0 * (16.0 * ci * co + x.v.size() + (double)rows * F * co));
+    Tensor y(rows, F, co);
+    // Scratch: V [16][tiles][cin], M [16][tiles][cout]. Only the generation
+    // thread runs convs, so buffers that only grow are enough.
+    static std::vector<float> Vb, Mb;
+    if (Vb.size() < (size_t)16 * tiles * ci) Vb.resize((size_t)16 * tiles * ci);
+    if (Mb.size() < (size_t)16 * tiles * co) Mb.resize((size_t)16 * tiles * co);
+    float *V = Vb.data(), *M = Mb.data();
+    const int chunks = std::min(tiles, pool().size() * 4);
+
+    // 1. Input transform. Output rows (2r, 2r+1) [+ skip] read input rows
+    //    2r + skip - 2 .. 2r + skip + 1 (causal); columns 2c-1 .. 2c+2.
+    pool().run(chunks, [&](int ch) {
+        for (int tl = tiles * ch / chunks; tl < tiles * (ch + 1) / chunks; tl++) {
+            const int r = tl / tf, cc = tl % tf;
+            const float *d[4][4];
+            for (int a = 0; a < 4; a++)
+                for (int b = 0; b < 4; b++) {
+                    const int t = 2 * r + skip - 2 + a, f = 2 * cc - 1 + b;
+                    d[a][b] = (t >= 0 && t < x.t && f >= 0 && f < F) ? x.at(t, f) : kZeros;
+                }
+            float *v[16];
+            for (int ij = 0; ij < 16; ij++) v[ij] = V + ((size_t)ij * tiles + tl) * ci;
+            for (int k = 0; k < ci; k++) {
+                float t[4][4], u[4][4];
+                for (int b = 0; b < 4; b++) { // t = B^T d (combine rows)
+                    t[0][b] = d[0][b][k] - d[2][b][k];
+                    t[1][b] = d[1][b][k] + d[2][b][k];
+                    t[2][b] = d[2][b][k] - d[1][b][k];
+                    t[3][b] = d[1][b][k] - d[3][b][k];
+                }
+                for (int a = 0; a < 4; a++) { // u = t B (combine columns)
+                    u[a][0] = t[a][0] - t[a][2];
+                    u[a][1] = t[a][1] + t[a][2];
+                    u[a][2] = t[a][2] - t[a][1];
+                    u[a][3] = t[a][1] - t[a][3];
+                }
+                for (int ij = 0; ij < 16; ij++) v[ij][k] = u[ij / 4][ij % 4];
+            }
+        }
+    });
+
+    // 2. The 16 matrix products, 4 tiles x 16 output channels per item.
+    const int blocks = (tiles + P - 1) / P, ctiles = co / CT;
+    const long items = 16L * blocks * ctiles;
+    const int gchunks = (int)std::min<long>(items, pool().size() * 8);
+    pool().run(gchunks, [&](int ch) {
+        for (long it = items * ch / gchunks; it < items * (ch + 1) / gchunks; it++) {
+            const int ij = (int)(it / ((long)blocks * ctiles)), rest = (int)(it % ((long)blocks * ctiles));
+            const int blk = rest / ctiles, ct = rest % ctiles;
+            const int t0 = blk * P, np = std::min(P, tiles - t0);
+            const float *in[P];
+            for (int p = 0; p < P; p++) in[p] = V + ((size_t)ij * tiles + t0 + std::min(p, np - 1)) * ci;
+            float acc[P][CT] = {};
+            micro_4x16(in, &c.wino[((size_t)ct * 16 + ij) * ci * CT], ci, acc);
+            for (int p = 0; p < np; p++)
+                std::copy(acc[p], acc[p] + CT, M + ((size_t)ij * tiles + t0 + p) * co + ct * CT);
+        }
+    });
+
+    // 3. Output transform Y = A^T M A, plus the bias.
+    pool().run(chunks, [&](int ch) {
+        for (int tl = tiles * ch / chunks; tl < tiles * (ch + 1) / chunks; tl++) {
+            const int r = tl / tf, cc = tl % tf;
+            const float *m[16];
+            for (int ij = 0; ij < 16; ij++) m[ij] = M + ((size_t)ij * tiles + tl) * co;
+            float *o00 = y.at(2 * r, 2 * cc), *o10 = y.at(2 * r + 1, 2 * cc);
+            const bool right = 2 * cc + 1 < F; // the last tile of an odd F has one column
+            for (int k = 0; k < co; k++) {
+                float s0[4], s1[4];
+                for (int b = 0; b < 4; b++) { // A^T m (combine rows)
+                    s0[b] = m[b][k] + m[4 + b][k] + m[8 + b][k];
+                    s1[b] = m[4 + b][k] - m[8 + b][k] - m[12 + b][k];
+                }
+                o00[k] = c.b[k] + (s0[0] + s0[1] + s0[2]);
+                o10[k] = c.b[k] + (s1[0] + s1[1] + s1[2]);
+                if (right) {
+                    o00[co + k] = c.b[k] + (s0[1] - s0[2] - s0[3]);
+                    o10[co + k] = c.b[k] + (s1[1] - s1[2] - s1[3]);
+                }
+            }
+        }
+    });
+    return y;
+}
+
 Tensor conv2d(const Tensor &x, const Conv &c, int pl, int pr, const char *label, int skip) {
+    if (!c.wino.empty()) {
+        assert(pl == 1 && pr == 1);
+        return conv_winograd(x, c, skip, label);
+    }
     const Geometry g = conv_geometry(x, c, pl, pr, skip);
     MRT2_PROF(label, 2.0 * g.to * g.fo * c.kt * c.kf * c.cin * c.cout,
               4.0 * ((double)c.kt * c.kf * c.cin * c.cout + x.v.size() + (double)g.to * g.fo * c.cout));

@@ -45,6 +45,10 @@ CodecWeights load_codec(const Weights &w) {
         B.up = load_conv(w, b + "conv2dtranspose_" + std::to_string(s.kt) + "x" + std::to_string(s.kf),
                          s.kt, s.kf, s.cin, s.cout);
         B.conv = load_conv(w, b + "conv2d_3x3", 3, 3, s.cout, s.cout);
+        // Winograd for the compute-heavy 3x3 convs (20..480 frequency bins).
+        // Not d0/d1 (and not the input residual unit): they are limited by
+        // reading their weights, and Winograd's weights are 16/9 larger.
+        if (i >= 2) B.conv.pack_winograd();
         if (s.cin != s.cout) B.shortcut = load_conv(w, b + "shortcut_layer/conv1x1", 1, 1, s.cin, s.cout);
         B.st = s.st;
         B.sf = s.sf;

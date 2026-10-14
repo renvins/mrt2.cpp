@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 
 using namespace mrt2;
 
@@ -87,7 +88,54 @@ TEST(fast_matches_reference) {
     CHECK(ok == n);
 }
 
+TEST(winograd_matches_reference) {
+    // Winograd F(2x2, 3x3) against the plain loops: odd and single
+    // frequency counts (half-empty last tile), a streaming call (skip = 2),
+    // and codec-sized values (inputs up to millions).
+    struct W { int cin, cout, t, f, skip; float scale; };
+    const W cases[] = {
+        {16, 16, 4, 1, 0, 1.0f},   // one frequency bin
+        {32, 48, 6, 5, 0, 1.0f},   // odd bins: the last tile has one column
+        {64, 64, 8, 20, 0, 1.0f},
+        {16, 32, 6, 7, 2, 1.0f},   // streaming: 2 remembered rows + 4 new
+        {64, 64, 6, 10, 2, 1e6f},  // codec-sized values
+    };
+    Rng rng(11);
+    int ok = 0;
+    double worst = 0;
+    bool stream_same = true;
+    for (const W &w : cases) {
+        Owned o = make_conv({false, 3, 3, w.cin, w.cout, w.t, w.f, 1, 1}, rng);
+        Conv cw = o.c; // same weights, plus their Winograd form
+        cw.pack_winograd();
+        Tensor x(w.t, w.f, w.cin);
+        for (float &v : x.v) v = w.scale * ((float)rng.uniform() - 0.5f);
+        const Tensor want = conv2d_ref(x, o.c, 1, 1); // all rows
+        const Tensor got = conv2d(x, cw, 1, 1, "conv", w.skip);
+        double err = 0, mag = 0;
+        const bool shape = got.t == w.t - w.skip && got.f == w.f && got.c == w.cout;
+        for (int t = 0; shape && t < got.t; t++)
+            for (int f = 0; f < w.f; f++)
+                for (int c = 0; c < w.cout; c++) {
+                    err = std::max(err, (double)std::fabs(got.at(t, f)[c] - want.at(t + w.skip, f)[c]));
+                    mag = std::max(mag, (double)std::fabs(want.at(t + w.skip, f)[c]));
+                }
+        const double rel = err / (mag + 1e-30);
+        worst = std::max(worst, rel);
+        ok += shape && rel < 1e-5;
+        if (w.skip) { // the same rows from one call over everything: same bits
+            const Tensor full = conv2d(x, cw, 1, 1, "conv", 0);
+            stream_same &= std::memcmp(full.at(w.skip, 0), got.v.data(), got.v.size() * 4) == 0;
+        }
+    }
+    std::printf("      %d / 5 Winograd shapes match the reference (worst relative error %.1e);"
+                " streaming call = full call: %s\n", ok, worst, stream_same ? "bit for bit" : "NO");
+    CHECK(ok == 5);
+    CHECK(stream_same);
+}
+
 int main() {
     RUN(fast_matches_reference);
+    RUN(winograd_matches_reference);
     return test::summary("test_conv");
 }
