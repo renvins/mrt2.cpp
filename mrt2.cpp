@@ -13,6 +13,7 @@
 // codec's first layers with fp16 weights; --fp32 for exact float32.
 #include "audio.h"
 #include "codec.h"
+#include "cpu.h"
 #include "depth.h"
 #include "encoder.h"
 #include "ring.h"
@@ -179,10 +180,10 @@ struct Engine {
         tw = load_temporal(w);
         dw = load_depth(w);
         cw = load_codec(w);
-        if (int8) { // "fast": int8 transformer, fp16 early codec layers
+        if (int8) { // "fast": int8 transformer, and fp16 early codec layers where that helps
             make_int8(tw);
             make_int8(dw);
-            make_fp16(cw);
+            if (cpu_prefers_fp16_weights()) make_fp16(cw);
         }
     }
 
@@ -229,7 +230,7 @@ static void start_engine(Engine &eng, const Options &o, const char *what) {
     std::printf("model loaded in %.0f ms\n", ms_since(t0));
     std::printf("%s | style: %s | temperature %.2f | top-k %d | seed %llu | %d threads | %s\n", what,
                 o.custom.empty() ? o.preset->prompt : "custom tokens", o.sampling.temperature, o.sampling.top_k,
-                (unsigned long long)o.seed, o.threads, o.int8 ? "int8 + fp16" : "float32");
+                (unsigned long long)o.seed, o.threads, !o.int8 ? "float32" : cpu_prefers_fp16_weights() ? "int8 + fp16" : "int8");
 }
 
 // ---- mrt2 generate --------------------------------------------------------------------

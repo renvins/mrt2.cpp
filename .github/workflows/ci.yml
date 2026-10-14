@@ -59,12 +59,17 @@ jobs:
           path: data
           key: mrt2-data-${{ env.MODEL_SHA256 }}-${{ env.REF_SHA256 }}
 
-      - name: Download model and test data
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Download model (with our download scripts) and test data
+        # Every run: with the cached model, the script checks its fingerprint
+        # ("already there"); without it, it downloads. Both paths get tested.
         run: |
           mkdir -p data
-          curl -fsSL --retry 3 -o data/mrt2_small.safetensors "$MODEL_URL"
-          curl -fsSL --retry 3 -o data/ref_small.safetensors "$REF_URL"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -NoProfile -File scripts/download_weights.ps1 -Dir data
+          else
+            scripts/download_weights.sh data
+          fi
+          [ -f data/ref_small.safetensors ] || curl -fsSL --retry 3 -o data/ref_small.safetensors "$REF_URL"
 
       - name: Check fingerprints
         run: |

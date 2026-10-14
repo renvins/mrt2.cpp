@@ -36,6 +36,21 @@ bool cpu_avx2();
 // MRT2_NO_DOTPROD=1 forces the plain kernel. Always false off ARM.
 bool cpu_dotprod();
 
+// Whether the fast mode should store the codec's first layers as fp16
+// (make_fp16 in codec.h). It halves the bytes those layers read, which
+// pays where they wait on memory: measured faster on x86 (CI: -2.5 ms on
+// Linux, -3.8 ms on Windows) and Apple chips (-1 ms on M4); slower on the
+// Linux ARM server (+1.2 ms: plenty of bandwidth, so only the conversion
+// cost remains) and neutral on Windows ARM. Fixed per platform, so a seed
+// always gives the same music on a given machine.
+inline bool cpu_prefers_fp16_weights() {
+#if defined(MRT2_X86) || defined(__APPLE__)
+    return true;
+#else
+    return false;
+#endif
+}
+
 // The processor's name ("AMD EPYC 7763 64-Core Processor", "Apple M4"),
 // for benchmark reports; "" if unknown.
 std::string cpu_name();
