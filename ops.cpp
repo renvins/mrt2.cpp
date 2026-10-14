@@ -131,22 +131,113 @@ static inline float fast_exp(float x) {
     return p * std::bit_cast<float>(((int32_t)n + 127) << 23);
 }
 
-void gelu_tanh(float *x, size_t n) {
-    // 0.5 * (1 + tanh(y)) == 1 / (1 + exp(-2y)), so
-    // gelu(x) = x / (1 + exp(-2y)) with y = sqrt(2/pi) (x + 0.044715 x^3):
-    // the same function, without tanh and without cancellation near 0.
-    const float c2 = 2.0f * 0.7978845608028654f;
-    for (size_t i = 0; i < n; i++) {
+// ---- the same exp, 4 (NEON) or 8 (AVX2) numbers at a time -------------------------
+//
+// Plain C++ loops using fast_exp vectorize on ARM, but not on baseline
+// x86: SSE2 has no vector floor, so x86 would compute one number at a
+// time (CI: ELU 8 ms per frame on Windows). And GCC doesn't vectorize them
+// on ARM either. So ELU and GELU are also written with intrinsics, sharing
+// these two helpers. Same algorithm as fast_exp: x = n ln2 + r,
+// exp(x) = 2^n * poly(r), with 2^n built in a float's exponent bits.
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+static inline float32x4_t exp_neon(float32x4_t x) {
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t c = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.0f)), vdupq_n_f32(88.0f));
+    // vfmaq_f32(a, b, c) = a + b * c; vfmsq_f32(a, b, c) = a - b * c.
+    const float32x4_t n = vrndmq_f32(vfmaq_f32(vdupq_n_f32(0.5f), c, vdupq_n_f32(1.44269504f))); // floor
+    float32x4_t r = vfmsq_f32(c, n, vdupq_n_f32(0.693145752f)); // ln2, high part
+    r = vfmsq_f32(r, n, vdupq_n_f32(1.42860677e-6f));          // ln2, low part
+    float32x4_t p = vdupq_n_f32(1.0f / 720);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 120), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 24), p, r);
+    p = vfmaq_f32(vdupq_n_f32(1.0f / 6), p, r);
+    p = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
+    p = vfmaq_f32(one, p, r);
+    p = vfmaq_f32(one, p, r);
+    const int32x4_t e = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127)), 23); // 2^n
+    return vmulq_f32(p, vreinterpretq_f32_s32(e));
+}
+#endif
+
+#if defined(MRT2_X86)
+MRT2_AVX2 static inline __m256 exp_avx2(__m256 x) {
+    const __m256 one = _mm256_set1_ps(1.0f);
+    const __m256 c = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-87.0f)), _mm256_set1_ps(88.0f));
+    const __m256 n = _mm256_floor_ps(_mm256_fmadd_ps(c, _mm256_set1_ps(1.44269504f), _mm256_set1_ps(0.5f)));
+    __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693145752f), c); // ln2, high part
+    r = _mm256_fnmadd_ps(n, _mm256_set1_ps(1.42860677e-6f), r);      // ln2, low part
+    __m256 p = _mm256_set1_ps(1.0f / 720);
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 120));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 24));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 6));
+    p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5f));
+    p = _mm256_fmadd_ps(p, r, one);
+    p = _mm256_fmadd_ps(p, r, one);
+    const __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(p, _mm256_castsi256_ps(e));
+}
+#endif
+
+// ---- GELU -----------------------------------------------------------------------------
+//
+// 0.5 * (1 + tanh(y)) == 1 / (1 + exp(-2y)), so
+// gelu(x) = x / (1 + exp(-2y)) with y = sqrt(2/pi) (x + 0.044715 x^3):
+// the same function, without tanh and without cancellation near 0.
+static const float kGeluC2 = 2.0f * 0.7978845608028654f;
+
+static void gelu_range(float *x, size_t i0, size_t i1) {
+    for (size_t i = i0; i < i1; i++) {
         const float v = x[i];
-        x[i] = v / (1.0f + fast_exp(-c2 * (v + 0.044715f * v * v * v)));
+        x[i] = v / (1.0f + fast_exp(-kGeluC2 * (v + 0.044715f * v * v * v)));
     }
 }
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+static void gelu_range_neon(float *x, size_t i0, size_t i1) {
+    size_t i = i0;
+    for (; i + 4 <= i1; i += 4) {
+        const float32x4_t v = vld1q_f32(x + i);
+        const float32x4_t inner = vfmaq_f32(v, vmulq_f32(vdupq_n_f32(0.044715f), v), vmulq_f32(v, v)); // v + 0.0447 v^3
+        const float32x4_t e = exp_neon(vmulq_f32(vdupq_n_f32(-kGeluC2), inner));
+        vst1q_f32(x + i, vdivq_f32(v, vaddq_f32(vdupq_n_f32(1.0f), e)));
+    }
+    gelu_range(x, i, i1); // the last < 4 numbers
+}
+#endif
+
+#if defined(MRT2_X86)
+MRT2_AVX2 static void gelu_range_avx2(float *x, size_t i0, size_t i1) {
+    size_t i = i0;
+    for (; i + 8 <= i1; i += 8) {
+        const __m256 v = _mm256_loadu_ps(x + i);
+        const __m256 inner = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_set1_ps(0.044715f), v), _mm256_mul_ps(v, v), v);
+        const __m256 e = exp_avx2(_mm256_mul_ps(_mm256_set1_ps(-kGeluC2), inner));
+        _mm256_storeu_ps(x + i, _mm256_div_ps(v, _mm256_add_ps(_mm256_set1_ps(1.0f), e)));
+    }
+    gelu_range(x, i, i1); // the last < 8 numbers
+}
+#endif
+
+void gelu_tanh(float *x, size_t n) {
+    // At most 4096 numbers (one FFN hidden layer): too few to share out.
+#if defined(__aarch64__) || defined(_M_ARM64)
+    gelu_range_neon(x, 0, n);
+#else
+#if defined(MRT2_X86)
+    if (cpu_avx2()) return gelu_range_avx2(x, 0, n);
+#endif
+    gelu_range(x, 0, n);
+#endif
+}
+
+// ---- ELU ------------------------------------------------------------------------------
 
 static void elu_range(float *x, size_t i0, size_t i1) {
     // x > 0: x. Otherwise exp(x) - 1, except near 0 where that subtraction
     // would lose digits (exp(x) ~ 1): there the series of expm1 is used,
     // x + x^2/2 + ... + x^8/8!, exact to float precision for |x| < 0.35.
-    // Every branch is a select, so the loop vectorizes.
+    // Every branch is a select, so the loop can vectorize.
     for (size_t i = i0; i < i1; i++) {
         const float v = x[i];
         const float series = v * (1.0f + v * (0.5f + v * (1.0f / 6 + v * (1.0f / 24 + v * (1.0f / 120 + v * (1.0f / 720 + v * (1.0f / 5040 + v * (1.0f / 40320))))))));
@@ -156,15 +247,13 @@ static void elu_range(float *x, size_t i0, size_t i1) {
 }
 
 #if defined(__aarch64__) || defined(_M_ARM64)
-// The same function, 4 numbers at a time with NEON (always present on
-// 64-bit ARM). Clang vectorizes the plain loop by itself, GCC doesn't
-// (CI: 3 ms per frame on Linux ARM), so it is written out.
+// Both branches for all 4 lanes, then a mask picks one per lane (vbslq).
 static void elu_range_neon(float *x, size_t i0, size_t i1) {
     const float32x4_t one = vdupq_n_f32(1.0f);
     size_t i = i0;
     for (; i + 4 <= i1; i += 4) {
         const float32x4_t v = vld1q_f32(x + i);
-        // Near 0: the expm1 series. vfmaq_f32(a, b, c) = a + b * c.
+        // Near 0: the expm1 series.
         float32x4_t s = vdupq_n_f32(1.0f / 40320);
         s = vfmaq_f32(vdupq_n_f32(1.0f / 5040), s, v);
         s = vfmaq_f32(vdupq_n_f32(1.0f / 720), s, v);
@@ -174,20 +263,7 @@ static void elu_range_neon(float *x, size_t i0, size_t i1) {
         s = vfmaq_f32(vdupq_n_f32(0.5f), s, v);
         s = vfmaq_f32(one, s, v);
         const float32x4_t series = vmulq_f32(s, v);
-        // Elsewhere: exp(x) - 1 = 2^n * poly(r) - 1.
-        const float32x4_t c = vminq_f32(vmaxq_f32(v, vdupq_n_f32(-87.0f)), vdupq_n_f32(88.0f));
-        const float32x4_t n = vrndmq_f32(vfmaq_f32(vdupq_n_f32(0.5f), c, vdupq_n_f32(1.44269504f))); // floor
-        float32x4_t r = vfmsq_f32(c, n, vdupq_n_f32(0.693145752f)); // c - n * ln2 (high part)
-        r = vfmsq_f32(r, n, vdupq_n_f32(1.42860677e-6f));          // ... (low part)
-        float32x4_t p = vdupq_n_f32(1.0f / 720);
-        p = vfmaq_f32(vdupq_n_f32(1.0f / 120), p, r);
-        p = vfmaq_f32(vdupq_n_f32(1.0f / 24), p, r);
-        p = vfmaq_f32(vdupq_n_f32(1.0f / 6), p, r);
-        p = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
-        p = vfmaq_f32(one, p, r);
-        p = vfmaq_f32(one, p, r);
-        const int32x4_t e = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127)), 23); // 2^n
-        const float32x4_t expm1 = vsubq_f32(vmulq_f32(p, vreinterpretq_f32_s32(e)), one);
+        const float32x4_t expm1 = vsubq_f32(exp_neon(v), one);
         const float32x4_t neg = vbslq_f32(vcgtq_f32(v, vdupq_n_f32(-0.35f)), series, expm1);
         vst1q_f32(x + i, vbslq_f32(vcgtq_f32(v, vdupq_n_f32(0.0f)), v, neg));
     }
@@ -196,10 +272,7 @@ static void elu_range_neon(float *x, size_t i0, size_t i1) {
 #endif
 
 #if defined(MRT2_X86)
-// The same function, 8 numbers at a time with AVX2. Plain C++ can't be
-// vectorized on baseline x86 (SSE2 has no vector floor), so without this
-// x86 computes ELU one number at a time. Both branches are computed for
-// all 8 lanes, then a mask picks one per lane (blendv).
+// Both branches for all 8 lanes, then a mask picks one per lane (blendv).
 MRT2_AVX2 static void elu_range_avx2(float *x, size_t i0, size_t i1) {
     const __m256 zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f);
     size_t i = i0;
@@ -215,21 +288,7 @@ MRT2_AVX2 static void elu_range_avx2(float *x, size_t i0, size_t i1) {
         s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(0.5f));
         s = _mm256_fmadd_ps(s, v, one);
         const __m256 series = _mm256_mul_ps(s, v);
-        // Elsewhere: exp(x) - 1, as fast_exp: x = n ln2 + r, exp = 2^n * poly(r).
-        const __m256 c = _mm256_min_ps(_mm256_max_ps(v, _mm256_set1_ps(-87.0f)), _mm256_set1_ps(88.0f));
-        const __m256 n = _mm256_floor_ps(_mm256_fmadd_ps(c, _mm256_set1_ps(1.44269504f), _mm256_set1_ps(0.5f)));
-        __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693145752f), c); // ln2, high part
-        r = _mm256_fnmadd_ps(n, _mm256_set1_ps(1.42860677e-6f), r);      // ln2, low part
-        __m256 p = _mm256_set1_ps(1.0f / 720);
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 120));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 24));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 6));
-        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5f));
-        p = _mm256_fmadd_ps(p, r, one);
-        p = _mm256_fmadd_ps(p, r, one);
-        // 2^n: n + 127 in a float's exponent field.
-        const __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
-        const __m256 expm1 = _mm256_sub_ps(_mm256_mul_ps(p, _mm256_castsi256_ps(e)), one);
+        const __m256 expm1 = _mm256_sub_ps(exp_avx2(v), one);
         const __m256 neg = _mm256_blendv_ps(expm1, series, _mm256_cmp_ps(v, _mm256_set1_ps(-0.35f), _CMP_GT_OQ));
         _mm256_storeu_ps(x + i, _mm256_blendv_ps(neg, v, _mm256_cmp_ps(v, zero, _CMP_GT_OQ)));
     }
@@ -242,8 +301,7 @@ void elu(float *x, size_t n) {
     const int chunks = n < 64 * 1024 ? 1 : 32;
 #if defined(__aarch64__) || defined(_M_ARM64)
     pool().run(chunks, [&](int c) { elu_range_neon(x, n * c / chunks, n * (c + 1) / chunks); });
-    return;
-#endif
+#else
 #if defined(MRT2_X86)
     if (cpu_avx2()) {
         pool().run(chunks, [&](int c) { elu_range_avx2(x, n * c / chunks, n * (c + 1) / chunks); });
@@ -251,6 +309,7 @@ void elu(float *x, size_t n) {
     }
 #endif
     pool().run(chunks, [&](int c) { elu_range(x, n * c / chunks, n * (c + 1) / chunks); });
+#endif
 }
 
 void softcap(float *x, size_t n, float cap) {

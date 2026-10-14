@@ -5,7 +5,7 @@
 #include "threads.h"
 #include <algorithm>
 #include <cassert>
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) || defined(_M_ARM64) // _M_ARM64: Visual Studio's name for 64-bit ARM
 #include <arm_neon.h>
 #endif
 
@@ -157,7 +157,7 @@ MRT2_AVX2 static void micro_4x16_avx2(const float *const x[P], const float *w, i
 // loop; each 16-weight vector loaded feeds 4 fused multiply-adds (one per
 // position) and each input value feeds 16 (one per channel).
 static inline void micro_4x16(const float *const x[P], const float *w, int cin, float acc[P][CT]) {
-#if defined(__ARM_NEON)
+#if defined(__ARM_NEON) || defined(_M_ARM64)
     float32x4_t a[P][4];
     MRT2_UNROLL
     for (int p = 0; p < P; p++)
@@ -193,6 +193,65 @@ static inline void micro_4x16(const float *const x[P], const float *w, int cin, 
         }
 #endif
 }
+
+// ---- few output channels: one long dot product per output ----------------------
+
+// sum over j < n of x[j] . w[tap[j]] (each a run of cin floats), with one set
+// of 16 running sums for the whole thing and a single horizontal add at the
+// end. (Calling dot() per tap would pay that final add 49 times per output
+// of the 7x7 layer, as much work as the multiplications themselves.)
+// Element i of a run goes to sum i % 16 (cin is a multiple of 16).
+#if defined(__aarch64__) || defined(_M_ARM64)
+static float tap_dot(const float *const x[], const int tap[], int n, const float *w, int cin) {
+    float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0; // sums 0-3, 4-7, 8-11, 12-15
+    for (int j = 0; j < n; j++) {
+        const float *a = x[j], *b = w + (size_t)tap[j] * cin;
+        for (int i = 0; i < cin; i += 16) {
+            a0 = vfmaq_f32(a0, vld1q_f32(a + i), vld1q_f32(b + i));
+            a1 = vfmaq_f32(a1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+            a2 = vfmaq_f32(a2, vld1q_f32(a + i + 8), vld1q_f32(b + i + 8));
+            a3 = vfmaq_f32(a3, vld1q_f32(a + i + 12), vld1q_f32(b + i + 12));
+        }
+    }
+    return vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+}
+#else
+static float tap_dot_plain(const float *const x[], const int tap[], int n, const float *w, int cin) {
+    float acc[16] = {};
+    for (int j = 0; j < n; j++) {
+        const float *a = x[j], *b = w + (size_t)tap[j] * cin;
+        for (int i = 0; i < cin; i += 16)
+            for (int k = 0; k < 16; k++) acc[k] += a[i + k] * b[i + k];
+    }
+    float s = 0.0f;
+    for (int k = 0; k < 16; k++) s += acc[k];
+    return s;
+}
+
+#if defined(MRT2_X86)
+MRT2_AVX2 static float tap_dot_avx2(const float *const x[], const int tap[], int n, const float *w, int cin) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = a0; // sums 0-7, 8-15
+    for (int j = 0; j < n; j++) {
+        const float *a = x[j], *b = w + (size_t)tap[j] * cin;
+        for (int i = 0; i < cin; i += 16) {
+            a0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), a0);
+            a1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + i + 8), _mm256_loadu_ps(b + i + 8), a1);
+        }
+    }
+    const __m256 t = _mm256_add_ps(a0, a1);
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(t), _mm256_extractf128_ps(t, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    return _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps(h, h, 1)));
+}
+#endif
+static float tap_dot(const float *const x[], const int tap[], int n, const float *w, int cin) {
+#if defined(MRT2_X86)
+    static const bool avx2 = cpu_avx2();
+    if (avx2) return tap_dot_avx2(x, tap, n, w, cin);
+#endif
+    return tap_dot_plain(x, tap, n, w, cin);
+}
+#endif
 
 // Inputs that fall on padding point here, so every tap of a block can be
 // computed the same way (zeros add nothing). Large enough for any cin.
@@ -259,10 +318,14 @@ static Tensor conv_core(const Tensor &x, const Conv &c, const Geometry &g) {
                         tap[n++] = k;
                     }
                 for (int o = 0; o < c.cout; o++) {
-                    float s = c.b[o];
                     const float *wo = &c.packed[(size_t)o * taps * c.cin];
-                    for (int j = 0; j < n; j++) s += dot(src[j], wo + (size_t)tap[j] * c.cin, c.cin);
-                    y.at(t, f)[o] = s;
+                    float s;
+                    if (c.cin % 16 == 0) s = tap_dot(src, tap, n, wo, c.cin);
+                    else { // any other size (not in this model): dot() per tap
+                        s = 0.0f;
+                        for (int j = 0; j < n; j++) s += dot(src[j], wo + (size_t)tap[j] * c.cin, c.cin);
+                    }
+                    y.at(t, f)[o] = c.b[o] + s;
                 }
             }
         });
