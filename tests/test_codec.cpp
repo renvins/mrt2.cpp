@@ -159,6 +159,46 @@ TEST(streaming_equals_offline) {
     CHECK(vs_google <= 1);
 }
 
+TEST(istft_fft_matches_direct_sum) {
+    // inverse_stft uses an FFT; here is the same thing written the slow,
+    // obvious way (the formula, summed directly), on a random spectrum.
+    const int steps = 8; // 2 frames: the first frame is silent (lookahead)
+    Tensor spec(steps, 480, 4);
+    Rng rng(42);
+    for (float &v : spec.v) v = (float)(2.0 * rng.uniform() - 1.0);
+    const std::vector<float> got = inverse_stft(spec);
+
+    const double pi = 3.14159265358979323846;
+    const int N = 960, H = 480;
+    std::vector<double> win(N), frames((size_t)steps * 2 * N, 0.0);
+    for (int n = 0; n < N; n++) {
+        auto hann = [&](int i) { return 0.5 - 0.5 * std::cos(2 * pi * i / N); };
+        const int m = n % H;
+        win[n] = hann(n) / (hann(m) * hann(m) + hann(m + H) * hann(m + H));
+    }
+    for (int t = 4; t < steps; t++)
+        for (int ch = 0; ch < 2; ch++)
+            for (int n = 0; n < N; n++) {
+                double x = spec.at(t, 0)[2 * ch]; // bin 0: real part only; bin 480: 0
+                for (int k = 1; k < 480; k++)
+                    x += 2.0 * (spec.at(t, k)[2 * ch] * std::cos(2 * pi * k * n / N) -
+                                spec.at(t, k)[2 * ch + 1] * std::sin(2 * pi * k * n / N));
+                frames[((size_t)t * 2 + ch) * N + n] = x / N * win[n];
+            }
+    double err = 0, mag = 0;
+    for (int t = 0; t < steps; t++)
+        for (int ch = 0; ch < 2; ch++)
+            for (int j = 0; j < H; j++) {
+                const double want = frames[((size_t)t * 2 + ch) * N + j] +
+                                    (t > 0 ? frames[((size_t)(t - 1) * 2 + ch) * N + H + j] : 0.0);
+                err = std::max(err, std::fabs(got[((size_t)t * H + j) * 2 + ch] - want));
+                mag = std::max(mag, std::fabs(want));
+            }
+    std::printf("      FFT vs direct sum, random spectrum: max difference %.2e (values up to %.3f)\n", err, mag);
+    CHECK(mag > 0.01);         // the test really produced sound
+    CHECK(err <= 1e-6 * mag);  // only float rounding of the result
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) {
         std::printf("usage: %s MODEL.safetensors REF.safetensors\n", argv[0]);
@@ -173,6 +213,7 @@ int main(int argc, char **argv) {
     W = &model;
     R = &ref;
     try {
+        RUN(istft_fft_matches_direct_sum);
         RUN(dequantize_matches_google);
         RUN(decoder_blocks_match_google);
         RUN(audio_from_our_tokens_matches_google);

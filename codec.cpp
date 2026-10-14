@@ -4,6 +4,7 @@
 #include "threads.h"
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <string>
 
@@ -152,10 +153,12 @@ Tensor decode(const CodecWeights &cw, const float *z, int frames, CodecDebug *db
 
 namespace {
 constexpr int kN = 960, kHop = 480, kBins = 480; // frame length, hop, stored bins
+using cd = std::complex<double>;
 
-// Computed once: the synthesis window and the cos/sin tables.
+// Computed once: the synthesis window and the FFT's "twiddle factors".
 struct IstftTables {
-    float win[kN], cs[kN], sn[kN];
+    float win[kN];
+    cd tw[kN]; // e^(+2 pi i j / N): the rotations the inverse FFT combines with
     IstftTables() {
         const double pi = 3.14159265358979323846;
         // Periodic Hann window, and Google's correction that makes the
@@ -165,8 +168,7 @@ struct IstftTables {
         for (int n = 0; n < kN; n++) {
             const double den = hann[n % kHop] * hann[n % kHop] + hann[n % kHop + kHop] * hann[n % kHop + kHop];
             win[n] = den == 0.0 ? 0.0f : (float)(hann[n] / den);
-            cs[n] = (float)std::cos(2 * pi * n / kN);
-            sn[n] = (float)std::sin(2 * pi * n / kN);
+            tw[n] = std::polar(1.0, 2 * pi * n / kN);
         }
     }
 };
@@ -176,33 +178,65 @@ const IstftTables &istft_tables() {
     return t;
 }
 
+// Inverse FFT (unnormalized): out[k] = sum_j in[j * stride] * e^(+2 pi i j k / n),
+// for n = 960 / (product of the factors already used), mixed radix.
+//
+// Divide and conquer: with n = p * m, split the input into p interleaved
+// sequences (every p-th sample), transform each (size m, recursively),
+// then combine: out[k + r m] = sum_q sub_q[k] * e^(2 pi i q (k + r m) / n).
+// 960 = 4 * 4 * 4 * 3 * 5: ~20k complex multiplies instead of the direct
+// sum's 460k.
+constexpr int kFactors[] = {4, 4, 4, 3, 5, 1};
+
+void ifft(const cd *in, int stride, cd *out, int n, const int *factor, const cd *tw) {
+    if (n == 1) {
+        out[0] = in[0];
+        return;
+    }
+    const int p = factor[0], m = n / p;
+    for (int q = 0; q < p; q++) ifft(in + q * stride, stride * p, out + q * m, m, factor + 1, tw);
+    // e^(2 pi i x / n) = tw[x * (N / n) mod N]
+    const int step = kN / n;
+    for (int k = 0; k < m; k++) {
+        cd t[5]; // the p sub-results for this k (out[q m + k], overwritten below)
+        for (int q = 0; q < p; q++) t[q] = out[q * m + k];
+        for (int r = 0; r < p; r++) {
+            cd sum = t[0];
+            for (int q = 1; q < p; q++) sum += t[q] * tw[(q * (k + r * m) * step) % kN];
+            out[k + r * m] = sum;
+        }
+    }
+}
+
 // One spectrum step of one channel -> its windowed 960 samples. An invalid
 // step (the first frame: the decoder's lookahead) counts as silence,
 // exactly as in Google's streaming output.
 void istft_step(const Tensor &spec, int t, int ch, bool valid, float cur[kN]) {
-    const IstftTables &T = istft_tables();
-    // Inverse real FFT of bins 0..479 (bin 480, Nyquist, is 0):
-    // x[n] = (Re X0 + 2 sum_k (Re Xk cos - Im Xk sin)(2 pi k n / N)) / N.
-    // The imaginary part of bin 0 is ignored, like numpy's irfft.
-    for (int n = 0; n < kN; n++) {
-        double s = 0.0;
-        if (valid) {
-            s = spec.at(t, 0)[2 * ch];
-            for (int k = 1; k < kBins; k++) {
-                const float *X = spec.at(t, k);
-                const int m = (int)(((long)k * n) % kN);
-                s += 2.0 * ((double)X[2 * ch] * T.cs[m] - (double)X[2 * ch + 1] * T.sn[m]);
-            }
-        }
-        cur[n] = (float)(s / kN) * T.win[n];
+    if (!valid) {
+        std::fill(cur, cur + kN, 0.0f);
+        return;
     }
+    const IstftTables &T = istft_tables();
+    // The full spectrum of a real signal: bin N - k is the conjugate of bin
+    // k. Bin 0 keeps only its real part and bin 480 (Nyquist) is 0, like
+    // numpy's irfft.
+    cd z[kN], x[kN];
+    z[0] = cd(spec.at(t, 0)[2 * ch], 0.0);
+    z[kBins] = cd(0.0, 0.0);
+    for (int k = 1; k < kBins; k++) {
+        const float *X = spec.at(t, k);
+        z[k] = cd(X[2 * ch], X[2 * ch + 1]);
+        z[kN - k] = std::conj(z[k]);
+    }
+    ifft(z, 1, x, kN, kFactors, T.tw);
+    for (int n = 0; n < kN; n++) cur[n] = (float)(x[n].real() / kN) * T.win[n];
 }
 } // namespace
 
 std::vector<float> inverse_stft(const Tensor &spec) {
     MRT2_STAGE("codec");
-    // direct inverse DFT: per step and channel, 960 outputs x 480 bins x 4 flops
-    MRT2_PROF("istft", 4.0 * spec.t * 2 * kN * kBins, 4.0 * spec.v.size());
+    // inverse FFT: per step and channel ~20k complex multiply-adds (8 flops)
+    MRT2_PROF("istft", 8.0 * 20000 * spec.t * 2, 4.0 * spec.v.size());
     const int steps = spec.t;
     // 1. Every step's windowed inverse DFT, for both channels, independently:
     //    spread over the threads. frames[t][ch][n]. Frame 0's 4 steps are invalid.
@@ -282,7 +316,7 @@ void decode_frame(const CodecWeights &cw, CodecStream &st, const float z[256], f
 
     // Inverse STFT of the 4 steps, then overlap-add with the remembered
     // half window. Frame 0 is the lookahead: silent.
-    MRT2_PROF("istft", 4.0 * 4 * 2 * kN * kBins, 4.0 * spec.v.size());
+    MRT2_PROF("istft", 8.0 * 20000 * 4 * 2, 4.0 * spec.v.size());
     float frames[4][2][kN];
     const bool valid = st.frame > 0;
     pool().run(8, [&](int job) { istft_step(spec, job / 2, job % 2, valid, frames[job / 2][job % 2]); });

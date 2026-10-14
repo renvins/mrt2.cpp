@@ -28,6 +28,13 @@ namespace mrt2 {
 // (for tests: both paths must give the same results).
 bool cpu_avx2();
 
+// True if this ARM CPU has the int8 dot-product instruction (sdot: every
+// Apple chip, Raspberry Pi 5, recent phones and servers; not the oldest
+// 64-bit ARM cores). GCC's default ARM target predates it, so the kernel
+// that uses it is compiled with a per-function attribute and chosen here.
+// MRT2_NO_DOTPROD=1 forces the plain kernel. Always false off ARM.
+bool cpu_dotprod();
+
 // The processor's name ("AMD EPYC 7763 64-Core Processor", "Apple M4"),
 // for benchmark reports; "" if unknown.
 std::string cpu_name();

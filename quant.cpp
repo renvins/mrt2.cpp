@@ -4,8 +4,13 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
-#if defined(__ARM_FEATURE_DOTPROD)
+// The sdot kernel: compiled for any 64-bit ARM with GCC or Clang (the
+// attribute enables the instruction for that one function), used only if
+// cpu_dotprod() says the CPU has it. MSVC has no such attribute: plain
+// kernel there for now.
+#if defined(__aarch64__) && !defined(_MSC_VER)
 #include <arm_neon.h>
+#define MRT2_SDOT_KERNEL __attribute__((target("+dotprod")))
 #endif
 
 // The SIMD kernels must give exactly the bits of q8_dot_ref(), which
@@ -81,12 +86,13 @@ float q8_dot_ref(const int8_t *qw, const float *dw, const int8_t *qx, const floa
     return (lane[0] + lane[1]) + (lane[2] + lane[3]);
 }
 
-#if defined(__ARM_FEATURE_DOTPROD)
+#if defined(MRT2_SDOT_KERNEL)
 // 4 blocks (128 numbers) per iteration. vdotq_s32 multiplies 16 int8 pairs
 // and adds them, in groups of 4, into the 4 int32 lanes of its accumulator;
 // three pairwise adds then give the 4 block sums [S0 S1 S2 S3] in one
 // vector, which is converted to float and scaled with one multiply.
-static float q8_dot(const int8_t *qw, const float *dw, const int8_t *qx, const float *dx, int in) {
+MRT2_SDOT_KERNEL static float q8_dot_sdot(const int8_t *qw, const float *dw, const int8_t *qx, const float *dx,
+                                           int in) {
     const int32x4_t zero = vdupq_n_s32(0);
     float32x4_t acc = vdupq_n_f32(0.0f);
     for (int b = 0; b < in / kQBlock; b += 4) {
@@ -101,12 +107,12 @@ static float q8_dot(const int8_t *qw, const float *dw, const int8_t *qx, const f
     }
     return (vgetq_lane_f32(acc, 0) + vgetq_lane_f32(acc, 1)) + (vgetq_lane_f32(acc, 2) + vgetq_lane_f32(acc, 3));
 }
-#else
-// No int8 dot instruction known at compile time: the plain version.
-static float q8_dot(const int8_t *qw, const float *dw, const int8_t *qx, const float *dx, int in) {
+#endif
+
+// No int8 dot instruction: the plain version.
+static float q8_dot_plain(const int8_t *qw, const float *dw, const int8_t *qx, const float *dx, int in) {
     return q8_dot_ref(qw, dw, qx, dx, in);
 }
-#endif
 
 #if defined(MRT2_X86)
 // AVX2 has no signed int8 x int8 dot product, but it has maddubs:
@@ -149,10 +155,13 @@ MRT2_AVX2 static float q8_dot_avx2(const int8_t *qw, const float *dw, const int8
 // The kernel for this CPU, chosen once.
 using QDot = float (*)(const int8_t *, const float *, const int8_t *, const float *, int);
 static QDot pick_q8_dot() {
+#if defined(MRT2_SDOT_KERNEL)
+    if (cpu_dotprod()) return q8_dot_sdot;
+#endif
 #if defined(MRT2_X86)
     if (cpu_avx2()) return q8_dot_avx2;
 #endif
-    return q8_dot;
+    return q8_dot_plain;
 }
 
 void q8_matvec(const QMatrix &m, const int8_t *qx, const float *dx, const float *b, float *y) {

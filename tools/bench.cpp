@@ -33,7 +33,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#if defined(__ARM_NEON) && !defined(_MSC_VER) // GCC-style inline asm below
+#if defined(__ARM_NEON) || defined(_M_ARM64)
 #include <arm_neon.h>
 #endif
 #if defined(__APPLE__)
@@ -120,8 +120,26 @@ static double peak_gflops() {
     float32x4_t t = vaddq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3)), vaddq_f32(vaddq_f32(f4, f5), vaddq_f32(f6, f7)));
     t = vaddq_f32(t, vaddq_f32(vaddq_f32(vaddq_f32(f8, f9), vaddq_f32(f10, f11)), vaddq_f32(vaddq_f32(f12, f13), vaddq_f32(f14, f15))));
     sink = vaddvq_f32(t); // stored before the clock is read again
+#elif defined(_M_ARM64)
+    // Visual Studio on ARM: no GCC-style asm, so intrinsics on 16 separate
+    // variables (MSVC keeps them in registers).
+    float32x4_t f0 = vdupq_n_f32(1), f1 = vdupq_n_f32(2), f2 = vdupq_n_f32(3), f3 = vdupq_n_f32(4);
+    float32x4_t f4 = vdupq_n_f32(5), f5 = vdupq_n_f32(6), f6 = vdupq_n_f32(7), f7 = vdupq_n_f32(8);
+    float32x4_t f8 = vdupq_n_f32(9), f9 = vdupq_n_f32(10), f10 = vdupq_n_f32(11), f11 = vdupq_n_f32(12);
+    float32x4_t f12 = vdupq_n_f32(13), f13 = vdupq_n_f32(14), f14 = vdupq_n_f32(15), f15 = vdupq_n_f32(16);
+    const float32x4_t a = vdupq_n_f32(va), b = vdupq_n_f32(vb);
+    auto t0 = Clock::now();
+    for (long it = 0; it < iters; it++) {
+        f0 = vfmaq_f32(f0, b, a); f1 = vfmaq_f32(f1, b, a); f2 = vfmaq_f32(f2, b, a); f3 = vfmaq_f32(f3, b, a);
+        f4 = vfmaq_f32(f4, b, a); f5 = vfmaq_f32(f5, b, a); f6 = vfmaq_f32(f6, b, a); f7 = vfmaq_f32(f7, b, a);
+        f8 = vfmaq_f32(f8, b, a); f9 = vfmaq_f32(f9, b, a); f10 = vfmaq_f32(f10, b, a); f11 = vfmaq_f32(f11, b, a);
+        f12 = vfmaq_f32(f12, b, a); f13 = vfmaq_f32(f13, b, a); f14 = vfmaq_f32(f14, b, a); f15 = vfmaq_f32(f15, b, a);
+    }
+    float32x4_t t = vaddq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3)), vaddq_f32(vaddq_f32(f4, f5), vaddq_f32(f6, f7)));
+    t = vaddq_f32(t, vaddq_f32(vaddq_f32(vaddq_f32(f8, f9), vaddq_f32(f10, f11)), vaddq_f32(vaddq_f32(f12, f13), vaddq_f32(f14, f15))));
+    sink = vaddvq_f32(t); // stored before the clock is read again
 #else
-    // No NEON: a portable estimate (an AVX2 version comes with x86 support).
+    // No NEON: a portable estimate.
     float acc[64];
     for (int i = 0; i < 64; i++) acc[i] = 1.0f + i * 1e-3f;
     const float a = va, b = vb;

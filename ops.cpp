@@ -297,8 +297,10 @@ MRT2_AVX2 static void elu_range_avx2(float *x, size_t i0, size_t i1) {
 #endif
 
 void elu(float *x, size_t n) {
-    // Element-wise, so any split gives the same bits.
-    const int chunks = n < 64 * 1024 ? 1 : 32;
+    // Element-wise, so any split gives the same bits. Streaming calls are
+    // mostly 16K-130K numbers per frame: split those too (one chunk per 8K,
+    // at most 32), else most of the codec's ELU runs on a single core.
+    const int chunks = n < 16 * 1024 ? 1 : (int)std::min<size_t>(32, n / 8192);
 #if defined(__aarch64__) || defined(_M_ARM64)
     pool().run(chunks, [&](int c) { elu_range_neon(x, n * c / chunks, n * (c + 1) / chunks); });
 #else

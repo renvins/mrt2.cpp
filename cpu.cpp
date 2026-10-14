@@ -7,6 +7,13 @@
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 #endif
+#if defined(__linux__) && defined(__aarch64__)
+#include <sys/auxv.h> // getauxval: the CPU features the Linux kernel found
+#endif
+#if defined(_WIN32) && (defined(_M_ARM64) || defined(__aarch64__))
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 namespace mrt2 {
 
@@ -36,6 +43,28 @@ static bool detect_avx2() {
 bool cpu_avx2() {
 #if defined(MRT2_X86)
     static const bool yes = !std::getenv("MRT2_NO_AVX2") && detect_avx2(); // checked once
+    return yes;
+#else
+    return false;
+#endif
+}
+
+bool cpu_dotprod() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    static const bool yes = [] {
+        if (std::getenv("MRT2_NO_DOTPROD")) return false;
+#if defined(__APPLE__)
+        int v = 0;
+        size_t n = sizeof v;
+        return sysctlbyname("hw.optional.arm.FEAT_DotProd", &v, &n, nullptr, 0) == 0 && v == 1;
+#elif defined(__linux__)
+        return (getauxval(AT_HWCAP) & (1UL << 20)) != 0; // HWCAP_ASIMDDP
+#elif defined(_WIN32)
+        return IsProcessorFeaturePresent(43) != 0; // PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE
+#else
+        return false;
+#endif
+    }();
     return yes;
 #else
     return false;
