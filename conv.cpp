@@ -1,4 +1,5 @@
 #include "conv.h"
+#include "cpu.h"
 #include "ops.h"
 #include "profile.h"
 #include "threads.h"
@@ -111,6 +112,32 @@ void Conv::pack() {
 
 // ---- the micro-kernel -------------------------------------------------------------
 
+#if defined(MRT2_X86)
+// The same tile with AVX2: 8 floats per register, so the 4 x 16 sums are
+// 8 registers. Per input channel: load the 16 weights once (2 registers),
+// then for each position broadcast its input value to all 8 lanes and do
+// 2 fused multiply-adds: 8 FMAs per 2 weight loads.
+MRT2_AVX2 static void micro_4x16_avx2(const float *const x[P], const float *w, int cin, float acc[P][CT]) {
+    __m256 a[P][2];
+    for (int p = 0; p < P; p++) {
+        a[p][0] = _mm256_loadu_ps(acc[p]);
+        a[p][1] = _mm256_loadu_ps(acc[p] + 8);
+    }
+    for (int ci = 0; ci < cin; ci++, w += CT) {
+        const __m256 w0 = _mm256_loadu_ps(w), w1 = _mm256_loadu_ps(w + 8);
+        for (int p = 0; p < P; p++) {
+            const __m256 xv = _mm256_broadcast_ss(x[p] + ci);
+            a[p][0] = _mm256_fmadd_ps(xv, w0, a[p][0]);
+            a[p][1] = _mm256_fmadd_ps(xv, w1, a[p][1]);
+        }
+    }
+    for (int p = 0; p < P; p++) {
+        _mm256_storeu_ps(acc[p], a[p][0]);
+        _mm256_storeu_ps(acc[p] + 8, a[p][1]);
+    }
+}
+#endif
+
 // acc[p][0..15] += sum_ci x[p][ci] * w[ci][0..15], for P = 4 positions.
 // The 4 x 16 = 64 running sums live in 16 vector registers for the whole
 // loop; each 16-weight vector loaded feeds 4 fused multiply-adds (one per
@@ -134,7 +161,11 @@ static inline void micro_4x16(const float *const x[P], const float *w, int cin, 
     for (int p = 0; p < P; p++)
         for (int j = 0; j < 4; j++) vst1q_f32(acc[p] + 4 * j, a[p][j]);
 #else
-    // Portable version (an AVX2 one comes with x86 support).
+#if defined(MRT2_X86)
+    static const bool avx2 = cpu_avx2(); // asked once; the branch then always goes the same way
+    if (avx2) return micro_4x16_avx2(x, w, cin, acc);
+#endif
+    // Portable version.
     for (int ci = 0; ci < cin; ci++, w += CT)
         for (int p = 0; p < P; p++) {
             const float xv = x[p][ci];

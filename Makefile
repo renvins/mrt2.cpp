@@ -7,8 +7,8 @@ STD = -std=c++20
 # Shared code, named once. Headers are listed as prerequisites so that
 # editing one rebuilds what uses it; $(filter %.cpp,$^) then passes only
 # the .cpp files to the compiler.
-CORE       = weights.cpp safetensors.cpp json.cpp mmap.cpp profile.cpp threads.cpp \
-             weights.h safetensors.h json.h mmap.h profile.h threads.h
+CORE       = weights.cpp safetensors.cpp json.cpp mmap.cpp profile.cpp threads.cpp cpu.cpp \
+             weights.h safetensors.h json.h mmap.h profile.h threads.h cpu.h
 MODEL_SRC  = ops.cpp ops.h quant.cpp quant.h blocks.cpp blocks.h encoder.cpp encoder.h \
              temporal.cpp temporal.h depth.cpp depth.h conv.cpp conv.h codec.cpp codec.h
 BUILD      = $(CXX) $(STD) $(CXXFLAGS) -o $@ $(filter %.cpp,$^)
@@ -45,7 +45,7 @@ tests/test_ops: tests/test_ops.cpp tests/test.h ops.cpp ops.h $(CORE)
 	$(BUILD)
 
 tests/test_conv: tests/test_conv.cpp tests/test.h conv.cpp conv.h ops.cpp ops.h profile.cpp profile.h \
-                 threads.cpp threads.h
+                 threads.cpp threads.h cpu.cpp cpu.h
 	$(BUILD)
 
 tests/test_encoder: tests/test_encoder.cpp tests/test.h $(MODEL_SRC) $(CORE)
