@@ -69,6 +69,9 @@ MRT2_AVX2 static double peak_gflops_avx2() {
     const __m256 a = _mm256_set1_ps(va), b = _mm256_set1_ps(vb);
     auto t0 = Clock::now();
     for (long it = 0; it < iters; it++)
+#if defined(__GNUC__)
+#pragma GCC unroll 12 // else GCC keeps acc[] in memory and measures far below the peak
+#endif
         for (int i = 0; i < 12; i++) acc[i] = _mm256_fmadd_ps(acc[i], a, b);
     __m256 t = acc[0];
     for (int i = 1; i < 12; i++) t = _mm256_add_ps(t, acc[i]);
@@ -89,16 +92,33 @@ static double peak_gflops() {
     const long iters = 40'000'000;
     volatile float sink = 0;
 #if defined(__ARM_NEON) && !defined(_MSC_VER) // GCC-style inline asm below
-    float32x4_t acc[16];
-    for (int i = 0; i < 16; i++) acc[i] = vdupq_n_f32(1.0f + i);
+    // 16 separate variables, not an array: GCC stores array elements
+    // bound to asm operands back to memory every iteration (16 stores per
+    // 16 FMAs), which halves the measured peak.
+    float32x4_t f0 = vdupq_n_f32(1), f1 = vdupq_n_f32(2), f2 = vdupq_n_f32(3), f3 = vdupq_n_f32(4);
+    float32x4_t f4 = vdupq_n_f32(5), f5 = vdupq_n_f32(6), f6 = vdupq_n_f32(7), f7 = vdupq_n_f32(8);
+    float32x4_t f8 = vdupq_n_f32(9), f9 = vdupq_n_f32(10), f10 = vdupq_n_f32(11), f11 = vdupq_n_f32(12);
+    float32x4_t f12 = vdupq_n_f32(13), f13 = vdupq_n_f32(14), f14 = vdupq_n_f32(15), f15 = vdupq_n_f32(16);
     const float32x4_t a = vdupq_n_f32(va), b = vdupq_n_f32(vb);
     auto t0 = Clock::now();
+    // Written in assembly: exactly 16 independent in-place FMAs per
+    // iteration, whatever the compiler (GCC and Clang arrange the C++
+    // version differently). Two blocks of 8: GCC allows at most 30
+    // operands per asm statement, and a read-write operand counts twice.
+#define MRT2_FMLA8(A0, A1, A2, A3, A4, A5, A6, A7)                                                             \
+    __asm__ volatile("fmla %0.4s, %8.4s, %9.4s\n\tfmla %1.4s, %8.4s, %9.4s\n\t"                              \
+                     "fmla %2.4s, %8.4s, %9.4s\n\tfmla %3.4s, %8.4s, %9.4s\n\t"                              \
+                     "fmla %4.4s, %8.4s, %9.4s\n\tfmla %5.4s, %8.4s, %9.4s\n\t"                              \
+                     "fmla %6.4s, %8.4s, %9.4s\n\tfmla %7.4s, %8.4s, %9.4s"                                    \
+                     : "+w"(A0), "+w"(A1), "+w"(A2), "+w"(A3), "+w"(A4), "+w"(A5), "+w"(A6), "+w"(A7)         \
+                     : "w"(b), "w"(a))
     for (long it = 0; it < iters; it++) {
-        for (int i = 0; i < 16; i++) acc[i] = vfmaq_f32(b, acc[i], a);
-        __asm__ volatile("" : "+w"(acc[0]), "+w"(acc[1]), "+w"(acc[2]), "+w"(acc[3]));
+        MRT2_FMLA8(f0, f1, f2, f3, f4, f5, f6, f7);
+        MRT2_FMLA8(f8, f9, f10, f11, f12, f13, f14, f15);
     }
-    float32x4_t t = acc[0];
-    for (int i = 1; i < 16; i++) t = vaddq_f32(t, acc[i]);
+#undef MRT2_FMLA8
+    float32x4_t t = vaddq_f32(vaddq_f32(vaddq_f32(f0, f1), vaddq_f32(f2, f3)), vaddq_f32(vaddq_f32(f4, f5), vaddq_f32(f6, f7)));
+    t = vaddq_f32(t, vaddq_f32(vaddq_f32(vaddq_f32(f8, f9), vaddq_f32(f10, f11)), vaddq_f32(vaddq_f32(f12, f13), vaddq_f32(f14, f15))));
     sink = vaddvq_f32(t); // stored before the clock is read again
 #else
     // No NEON: a portable estimate (an AVX2 version comes with x86 support).

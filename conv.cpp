@@ -112,6 +112,17 @@ void Conv::pack() {
 
 // ---- the micro-kernel -------------------------------------------------------------
 
+// The micro-kernels keep their 4 x 16 running sums in arrays indexed by
+// small loops (p < 4, j < 4). They only stay in registers if the compiler
+// unrolls those loops completely; GCC at -O2 doesn't (it kept the sums on
+// the stack: CI measured 38% of peak on Linux vs 70% with MSVC), so ask.
+// Clang accepts the same pragma; MSVC unrolls by itself.
+#if defined(__GNUC__)
+#define MRT2_UNROLL _Pragma("GCC unroll 16")
+#else
+#define MRT2_UNROLL
+#endif
+
 #if defined(MRT2_X86)
 // The same tile with AVX2: 8 floats per register, so the 4 x 16 sums are
 // 8 registers. Per input channel: load the 16 weights once (2 registers),
@@ -119,18 +130,21 @@ void Conv::pack() {
 // 2 fused multiply-adds: 8 FMAs per 2 weight loads.
 MRT2_AVX2 static void micro_4x16_avx2(const float *const x[P], const float *w, int cin, float acc[P][CT]) {
     __m256 a[P][2];
+    MRT2_UNROLL
     for (int p = 0; p < P; p++) {
         a[p][0] = _mm256_loadu_ps(acc[p]);
         a[p][1] = _mm256_loadu_ps(acc[p] + 8);
     }
     for (int ci = 0; ci < cin; ci++, w += CT) {
         const __m256 w0 = _mm256_loadu_ps(w), w1 = _mm256_loadu_ps(w + 8);
+        MRT2_UNROLL
         for (int p = 0; p < P; p++) {
             const __m256 xv = _mm256_broadcast_ss(x[p] + ci);
             a[p][0] = _mm256_fmadd_ps(xv, w0, a[p][0]);
             a[p][1] = _mm256_fmadd_ps(xv, w1, a[p][1]);
         }
     }
+    MRT2_UNROLL
     for (int p = 0; p < P; p++) {
         _mm256_storeu_ps(acc[p], a[p][0]);
         _mm256_storeu_ps(acc[p] + 8, a[p][1]);
@@ -145,11 +159,14 @@ MRT2_AVX2 static void micro_4x16_avx2(const float *const x[P], const float *w, i
 static inline void micro_4x16(const float *const x[P], const float *w, int cin, float acc[P][CT]) {
 #if defined(__ARM_NEON)
     float32x4_t a[P][4];
+    MRT2_UNROLL
     for (int p = 0; p < P; p++)
+        MRT2_UNROLL
         for (int j = 0; j < 4; j++) a[p][j] = vld1q_f32(acc[p] + 4 * j);
     for (int ci = 0; ci < cin; ci++, w += CT) {
         const float32x4_t w0 = vld1q_f32(w), w1 = vld1q_f32(w + 4);
         const float32x4_t w2 = vld1q_f32(w + 8), w3 = vld1q_f32(w + 12);
+        MRT2_UNROLL
         for (int p = 0; p < P; p++) {
             const float xv = x[p][ci];
             a[p][0] = vfmaq_n_f32(a[p][0], w0, xv);
@@ -158,7 +175,9 @@ static inline void micro_4x16(const float *const x[P], const float *w, int cin, 
             a[p][3] = vfmaq_n_f32(a[p][3], w3, xv);
         }
     }
+    MRT2_UNROLL
     for (int p = 0; p < P; p++)
+        MRT2_UNROLL
         for (int j = 0; j < 4; j++) vst1q_f32(acc[p] + 4 * j, a[p][j]);
 #else
 #if defined(MRT2_X86)
@@ -167,6 +186,7 @@ static inline void micro_4x16(const float *const x[P], const float *w, int cin, 
 #endif
     // Portable version.
     for (int ci = 0; ci < cin; ci++, w += CT)
+        MRT2_UNROLL
         for (int p = 0; p < P; p++) {
             const float xv = x[p][ci];
             for (int j = 0; j < CT; j++) acc[p][j] += xv * w[j];

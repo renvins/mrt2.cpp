@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "cpu.h"
 #include "threads.h"
 #include <algorithm>
 #include <bit>
@@ -6,6 +7,9 @@
 #include <cstdint>
 #include <limits>
 #include <vector>
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
 
 namespace mrt2 {
 
@@ -151,9 +155,101 @@ static void elu_range(float *x, size_t i0, size_t i1) {
     }
 }
 
+#if defined(__aarch64__) || defined(_M_ARM64)
+// The same function, 4 numbers at a time with NEON (always present on
+// 64-bit ARM). Clang vectorizes the plain loop by itself, GCC doesn't
+// (CI: 3 ms per frame on Linux ARM), so it is written out.
+static void elu_range_neon(float *x, size_t i0, size_t i1) {
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    size_t i = i0;
+    for (; i + 4 <= i1; i += 4) {
+        const float32x4_t v = vld1q_f32(x + i);
+        // Near 0: the expm1 series. vfmaq_f32(a, b, c) = a + b * c.
+        float32x4_t s = vdupq_n_f32(1.0f / 40320);
+        s = vfmaq_f32(vdupq_n_f32(1.0f / 5040), s, v);
+        s = vfmaq_f32(vdupq_n_f32(1.0f / 720), s, v);
+        s = vfmaq_f32(vdupq_n_f32(1.0f / 120), s, v);
+        s = vfmaq_f32(vdupq_n_f32(1.0f / 24), s, v);
+        s = vfmaq_f32(vdupq_n_f32(1.0f / 6), s, v);
+        s = vfmaq_f32(vdupq_n_f32(0.5f), s, v);
+        s = vfmaq_f32(one, s, v);
+        const float32x4_t series = vmulq_f32(s, v);
+        // Elsewhere: exp(x) - 1 = 2^n * poly(r) - 1.
+        const float32x4_t c = vminq_f32(vmaxq_f32(v, vdupq_n_f32(-87.0f)), vdupq_n_f32(88.0f));
+        const float32x4_t n = vrndmq_f32(vfmaq_f32(vdupq_n_f32(0.5f), c, vdupq_n_f32(1.44269504f))); // floor
+        float32x4_t r = vfmsq_f32(c, n, vdupq_n_f32(0.693145752f)); // c - n * ln2 (high part)
+        r = vfmsq_f32(r, n, vdupq_n_f32(1.42860677e-6f));          // ... (low part)
+        float32x4_t p = vdupq_n_f32(1.0f / 720);
+        p = vfmaq_f32(vdupq_n_f32(1.0f / 120), p, r);
+        p = vfmaq_f32(vdupq_n_f32(1.0f / 24), p, r);
+        p = vfmaq_f32(vdupq_n_f32(1.0f / 6), p, r);
+        p = vfmaq_f32(vdupq_n_f32(0.5f), p, r);
+        p = vfmaq_f32(one, p, r);
+        p = vfmaq_f32(one, p, r);
+        const int32x4_t e = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127)), 23); // 2^n
+        const float32x4_t expm1 = vsubq_f32(vmulq_f32(p, vreinterpretq_f32_s32(e)), one);
+        const float32x4_t neg = vbslq_f32(vcgtq_f32(v, vdupq_n_f32(-0.35f)), series, expm1);
+        vst1q_f32(x + i, vbslq_f32(vcgtq_f32(v, vdupq_n_f32(0.0f)), v, neg));
+    }
+    elu_range(x, i, i1); // the last < 4 numbers
+}
+#endif
+
+#if defined(MRT2_X86)
+// The same function, 8 numbers at a time with AVX2. Plain C++ can't be
+// vectorized on baseline x86 (SSE2 has no vector floor), so without this
+// x86 computes ELU one number at a time. Both branches are computed for
+// all 8 lanes, then a mask picks one per lane (blendv).
+MRT2_AVX2 static void elu_range_avx2(float *x, size_t i0, size_t i1) {
+    const __m256 zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f);
+    size_t i = i0;
+    for (; i + 8 <= i1; i += 8) {
+        const __m256 v = _mm256_loadu_ps(x + i);
+        // Near 0: the expm1 series, x + x^2/2 + ... + x^8/8!
+        __m256 s = _mm256_set1_ps(1.0f / 40320);
+        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 5040));
+        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 720));
+        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 120));
+        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 24));
+        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 6));
+        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(0.5f));
+        s = _mm256_fmadd_ps(s, v, one);
+        const __m256 series = _mm256_mul_ps(s, v);
+        // Elsewhere: exp(x) - 1, as fast_exp: x = n ln2 + r, exp = 2^n * poly(r).
+        const __m256 c = _mm256_min_ps(_mm256_max_ps(v, _mm256_set1_ps(-87.0f)), _mm256_set1_ps(88.0f));
+        const __m256 n = _mm256_floor_ps(_mm256_fmadd_ps(c, _mm256_set1_ps(1.44269504f), _mm256_set1_ps(0.5f)));
+        __m256 r = _mm256_fnmadd_ps(n, _mm256_set1_ps(0.693145752f), c); // ln2, high part
+        r = _mm256_fnmadd_ps(n, _mm256_set1_ps(1.42860677e-6f), r);      // ln2, low part
+        __m256 p = _mm256_set1_ps(1.0f / 720);
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 120));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 24));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0f / 6));
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(0.5f));
+        p = _mm256_fmadd_ps(p, r, one);
+        p = _mm256_fmadd_ps(p, r, one);
+        // 2^n: n + 127 in a float's exponent field.
+        const __m256i e = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvtps_epi32(n), _mm256_set1_epi32(127)), 23);
+        const __m256 expm1 = _mm256_sub_ps(_mm256_mul_ps(p, _mm256_castsi256_ps(e)), one);
+        const __m256 neg = _mm256_blendv_ps(expm1, series, _mm256_cmp_ps(v, _mm256_set1_ps(-0.35f), _CMP_GT_OQ));
+        _mm256_storeu_ps(x + i, _mm256_blendv_ps(neg, v, _mm256_cmp_ps(v, zero, _CMP_GT_OQ)));
+    }
+    elu_range(x, i, i1); // the last < 8 numbers
+}
+#endif
+
 void elu(float *x, size_t n) {
     // Element-wise, so any split gives the same bits.
     const int chunks = n < 64 * 1024 ? 1 : 32;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    pool().run(chunks, [&](int c) { elu_range_neon(x, n * c / chunks, n * (c + 1) / chunks); });
+    return;
+#endif
+#if defined(MRT2_X86)
+    if (cpu_avx2()) {
+        pool().run(chunks, [&](int c) { elu_range_avx2(x, n * c / chunks, n * (c + 1) / chunks); });
+        return;
+    }
+#endif
     pool().run(chunks, [&](int c) { elu_range(x, n * c / chunks, n * (c + 1) / chunks); });
 }
 
