@@ -15,9 +15,19 @@ BUILD      = $(CXX) $(STD) $(CXXFLAGS) -o $@ $(filter %.cpp,$^)
 
 all: mrt2 mrt2dump mrt2info
 
-# The program: generate music.
-mrt2: mrt2.cpp $(MODEL_SRC) $(CORE)
-	$(BUILD)
+# The program: generate music. Audio output uses the OS's own API, linked
+# from the system: CoreAudio (macOS) or ALSA (Linux, needs the libasound
+# development headers to build); Windows (WASAPI) needs only ole32.
+UNAME := $(shell uname -s)
+ifeq ($(UNAME),Darwin)
+AUDIO_LIBS = -framework AudioToolbox -framework CoreFoundation
+else ifeq ($(OS),Windows_NT)
+AUDIO_LIBS = -lole32
+else
+AUDIO_LIBS = -lasound -lpthread
+endif
+mrt2: mrt2.cpp audio.cpp audio.h ring.h $(MODEL_SRC) $(CORE)
+	$(BUILD) $(AUDIO_LIBS)
 
 mrt2dump: mrt2dump.cpp mmap.cpp mmap.h
 	$(BUILD)
@@ -53,6 +63,9 @@ tests/test_codec: tests/test_codec.cpp tests/test.h $(MODEL_SRC) $(CORE)
 tests/test_threads: tests/test_threads.cpp tests/test.h $(MODEL_SRC) $(CORE)
 	$(BUILD)
 
+tests/test_ring: tests/test_ring.cpp tests/test.h ring.h
+	$(BUILD)
+
 tests/test_quant: tests/test_quant.cpp tests/test.h $(MODEL_SRC) $(CORE)
 	$(BUILD)
 
@@ -78,7 +91,7 @@ bench: tools/bench
 # Override the paths with `make test MODEL=... REF=...`.
 MODEL ?= $(HOME)/models/magenta-rt-v2/checkpoints/mrt2_small.safetensors
 REF   ?= $(HOME)/models/magenta-rt-v2/ref/ref_small.safetensors
-UNIT_TESTS = tests/test_conv
+UNIT_TESTS = tests/test_conv tests/test_ring
 FILE_TESTS = tests/test_mmap tests/test_weights
 REF_TESTS  = tests/test_ops tests/test_encoder tests/test_temporal tests/test_depth tests/test_codec \
              tests/test_threads tests/test_quant
