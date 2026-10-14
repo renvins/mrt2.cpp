@@ -60,14 +60,9 @@ void make_int8(FFNWeights &f) {
     q8_append_kernel(f.q8_w2, f.w2, f.hidden, f.model, 0, f.model);
 }
 
-static float dot(const float *a, const float *b, int n) {
-    float s = 0.0f;
-    for (int i = 0; i < n; i++) s += a[i] * b[i];
-    return s;
-}
-
 // One query against the (optional) sink and the n valid slots, all heads:
-// ctx[head] = softmax(scores) . values.
+// ctx[head] = softmax(scores) . values. (Tried: sharing the heads out over
+// the threads. No measurable gain: each head is small, 42 x 128.)
 static void attend(const AttentionWeights &a, const float *q, const float *keys, const float *values,
                    int n, float *ctx) {
     assert(n >= 1 && n <= kMaxKeys);

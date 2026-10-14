@@ -122,6 +122,7 @@ void layernorm(const float *x, const float *gamma, const float *beta, size_t n,
 //   exp(x) = 2^n * exp(r), exp(r) from a degree-6 polynomial (error ~1e-7),
 //   2^n made directly in the float's exponent bits.
 // Inputs are clamped to [-87, 88], the range of normal float results.
+#if !(defined(__aarch64__) || defined(_M_ARM64)) // ARM uses exp_neon for every number
 static inline float fast_exp(float x) {
     x = x < -87.0f ? -87.0f : x > 88.0f ? 88.0f : x;
     const float n = std::floor(x * 1.44269504f + 0.5f); // round(x / ln2)
@@ -130,6 +131,7 @@ static inline float fast_exp(float x) {
     const float p = 1.0f + r * (1.0f + r * (0.5f + r * (1.0f / 6 + r * (1.0f / 24 + r * (1.0f / 120 + r * (1.0f / 720))))));
     return p * std::bit_cast<float>(((int32_t)n + 127) << 23);
 }
+#endif
 
 // ---- the same exp, 4 (NEON) or 8 (AVX2) numbers at a time -------------------------
 //
@@ -186,36 +188,50 @@ MRT2_AVX2 static inline __m256 exp_avx2(__m256 x) {
 // the same function, without tanh and without cancellation near 0.
 static const float kGeluC2 = 2.0f * 0.7978845608028654f;
 
+#if !(defined(__aarch64__) || defined(_M_ARM64)) // ARM uses NEON for every number
 static void gelu_range(float *x, size_t i0, size_t i1) {
     for (size_t i = i0; i < i1; i++) {
         const float v = x[i];
         x[i] = v / (1.0f + fast_exp(-kGeluC2 * (v + 0.044715f * v * v * v)));
     }
 }
+#endif
 
 #if defined(__aarch64__) || defined(_M_ARM64)
+static inline float32x4_t gelu4_neon(float32x4_t v) {
+    const float32x4_t inner = vfmaq_f32(v, vmulq_f32(vdupq_n_f32(0.044715f), v), vmulq_f32(v, v)); // v + 0.0447 v^3
+    const float32x4_t e = exp_neon(vmulq_f32(vdupq_n_f32(-kGeluC2), inner));
+    return vdivq_f32(v, vaddq_f32(vdupq_n_f32(1.0f), e));
+}
+
 static void gelu_range_neon(float *x, size_t i0, size_t i1) {
     size_t i = i0;
-    for (; i + 4 <= i1; i += 4) {
-        const float32x4_t v = vld1q_f32(x + i);
-        const float32x4_t inner = vfmaq_f32(v, vmulq_f32(vdupq_n_f32(0.044715f), v), vmulq_f32(v, v)); // v + 0.0447 v^3
-        const float32x4_t e = exp_neon(vmulq_f32(vdupq_n_f32(-kGeluC2), inner));
-        vst1q_f32(x + i, vdivq_f32(v, vaddq_f32(vdupq_n_f32(1.0f), e)));
+    for (; i + 4 <= i1; i += 4) vst1q_f32(x + i, gelu4_neon(vld1q_f32(x + i)));
+    if (i < i1) { // the last < 4 numbers: through the same code, padded
+        float t[4] = {};
+        std::copy(x + i, x + i1, t);
+        vst1q_f32(t, gelu4_neon(vld1q_f32(t)));
+        std::copy(t, t + (i1 - i), x + i);
     }
-    gelu_range(x, i, i1); // the last < 4 numbers
 }
 #endif
 
 #if defined(MRT2_X86)
+MRT2_AVX2 static inline __m256 gelu8_avx2(__m256 v) {
+    const __m256 inner = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_set1_ps(0.044715f), v), _mm256_mul_ps(v, v), v);
+    const __m256 e = exp_avx2(_mm256_mul_ps(_mm256_set1_ps(-kGeluC2), inner));
+    return _mm256_div_ps(v, _mm256_add_ps(_mm256_set1_ps(1.0f), e));
+}
+
 MRT2_AVX2 static void gelu_range_avx2(float *x, size_t i0, size_t i1) {
     size_t i = i0;
-    for (; i + 8 <= i1; i += 8) {
-        const __m256 v = _mm256_loadu_ps(x + i);
-        const __m256 inner = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_set1_ps(0.044715f), v), _mm256_mul_ps(v, v), v);
-        const __m256 e = exp_avx2(_mm256_mul_ps(_mm256_set1_ps(-kGeluC2), inner));
-        _mm256_storeu_ps(x + i, _mm256_div_ps(v, _mm256_add_ps(_mm256_set1_ps(1.0f), e)));
+    for (; i + 8 <= i1; i += 8) _mm256_storeu_ps(x + i, gelu8_avx2(_mm256_loadu_ps(x + i)));
+    if (i < i1) { // the last < 8 numbers: through the same code, padded
+        float t[8] = {};
+        std::copy(x + i, x + i1, t);
+        _mm256_storeu_ps(t, gelu8_avx2(_mm256_loadu_ps(t)));
+        std::copy(t, t + (i1 - i), x + i);
     }
-    gelu_range(x, i, i1); // the last < 8 numbers
 }
 #endif
 
@@ -233,6 +249,7 @@ void gelu_tanh(float *x, size_t n) {
 
 // ---- ELU ------------------------------------------------------------------------------
 
+#if !(defined(__aarch64__) || defined(_M_ARM64)) // ARM uses NEON for every number
 static void elu_range(float *x, size_t i0, size_t i1) {
     // x > 0: x. Otherwise exp(x) - 1, except near 0 where that subtraction
     // would lose digits (exp(x) ~ 1): there the series of expm1 is used,
@@ -245,59 +262,77 @@ static void elu_range(float *x, size_t i0, size_t i1) {
         x[i] = v > 0.0f ? v : neg;
     }
 }
+#endif
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 // Both branches for all 4 lanes, then a mask picks one per lane (vbslq).
-static void elu_range_neon(float *x, size_t i0, size_t i1) {
+static inline float32x4_t elu4_neon(float32x4_t v) {
     const float32x4_t one = vdupq_n_f32(1.0f);
+    // Near 0: the expm1 series.
+    float32x4_t s = vdupq_n_f32(1.0f / 40320);
+    s = vfmaq_f32(vdupq_n_f32(1.0f / 5040), s, v);
+    s = vfmaq_f32(vdupq_n_f32(1.0f / 720), s, v);
+    s = vfmaq_f32(vdupq_n_f32(1.0f / 120), s, v);
+    s = vfmaq_f32(vdupq_n_f32(1.0f / 24), s, v);
+    s = vfmaq_f32(vdupq_n_f32(1.0f / 6), s, v);
+    s = vfmaq_f32(vdupq_n_f32(0.5f), s, v);
+    s = vfmaq_f32(one, s, v);
+    const float32x4_t series = vmulq_f32(s, v);
+    const float32x4_t expm1 = vsubq_f32(exp_neon(v), one);
+    const float32x4_t neg = vbslq_f32(vcgtq_f32(v, vdupq_n_f32(-0.35f)), series, expm1);
+    return vbslq_f32(vcgtq_f32(v, vdupq_n_f32(0.0f)), v, neg);
+}
+
+// Every number goes through elu4_neon, the leftovers too (padded): so the
+// result for a number never depends on where a chunk boundary fell.
+static void elu_range_neon(float *x, size_t i0, size_t i1) {
     size_t i = i0;
-    for (; i + 4 <= i1; i += 4) {
-        const float32x4_t v = vld1q_f32(x + i);
-        // Near 0: the expm1 series.
-        float32x4_t s = vdupq_n_f32(1.0f / 40320);
-        s = vfmaq_f32(vdupq_n_f32(1.0f / 5040), s, v);
-        s = vfmaq_f32(vdupq_n_f32(1.0f / 720), s, v);
-        s = vfmaq_f32(vdupq_n_f32(1.0f / 120), s, v);
-        s = vfmaq_f32(vdupq_n_f32(1.0f / 24), s, v);
-        s = vfmaq_f32(vdupq_n_f32(1.0f / 6), s, v);
-        s = vfmaq_f32(vdupq_n_f32(0.5f), s, v);
-        s = vfmaq_f32(one, s, v);
-        const float32x4_t series = vmulq_f32(s, v);
-        const float32x4_t expm1 = vsubq_f32(exp_neon(v), one);
-        const float32x4_t neg = vbslq_f32(vcgtq_f32(v, vdupq_n_f32(-0.35f)), series, expm1);
-        vst1q_f32(x + i, vbslq_f32(vcgtq_f32(v, vdupq_n_f32(0.0f)), v, neg));
+    for (; i + 4 <= i1; i += 4) vst1q_f32(x + i, elu4_neon(vld1q_f32(x + i)));
+    if (i < i1) {
+        float t[4] = {};
+        std::copy(x + i, x + i1, t);
+        vst1q_f32(t, elu4_neon(vld1q_f32(t)));
+        std::copy(t, t + (i1 - i), x + i);
     }
-    elu_range(x, i, i1); // the last < 4 numbers
 }
 #endif
 
 #if defined(MRT2_X86)
 // Both branches for all 8 lanes, then a mask picks one per lane (blendv).
-MRT2_AVX2 static void elu_range_avx2(float *x, size_t i0, size_t i1) {
+MRT2_AVX2 static inline __m256 elu8_avx2(__m256 v) {
     const __m256 zero = _mm256_setzero_ps(), one = _mm256_set1_ps(1.0f);
+    // Near 0: the expm1 series, x + x^2/2 + ... + x^8/8!
+    __m256 s = _mm256_set1_ps(1.0f / 40320);
+    s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 5040));
+    s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 720));
+    s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 120));
+    s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 24));
+    s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 6));
+    s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(0.5f));
+    s = _mm256_fmadd_ps(s, v, one);
+    const __m256 series = _mm256_mul_ps(s, v);
+    const __m256 expm1 = _mm256_sub_ps(exp_avx2(v), one);
+    const __m256 neg = _mm256_blendv_ps(expm1, series, _mm256_cmp_ps(v, _mm256_set1_ps(-0.35f), _CMP_GT_OQ));
+    return _mm256_blendv_ps(neg, v, _mm256_cmp_ps(v, zero, _CMP_GT_OQ));
+}
+
+// Every number goes through elu8_avx2, the leftovers too (padded): so the
+// result for a number never depends on where a chunk boundary fell.
+MRT2_AVX2 static void elu_range_avx2(float *x, size_t i0, size_t i1) {
     size_t i = i0;
-    for (; i + 8 <= i1; i += 8) {
-        const __m256 v = _mm256_loadu_ps(x + i);
-        // Near 0: the expm1 series, x + x^2/2 + ... + x^8/8!
-        __m256 s = _mm256_set1_ps(1.0f / 40320);
-        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 5040));
-        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 720));
-        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 120));
-        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 24));
-        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(1.0f / 6));
-        s = _mm256_fmadd_ps(s, v, _mm256_set1_ps(0.5f));
-        s = _mm256_fmadd_ps(s, v, one);
-        const __m256 series = _mm256_mul_ps(s, v);
-        const __m256 expm1 = _mm256_sub_ps(exp_avx2(v), one);
-        const __m256 neg = _mm256_blendv_ps(expm1, series, _mm256_cmp_ps(v, _mm256_set1_ps(-0.35f), _CMP_GT_OQ));
-        _mm256_storeu_ps(x + i, _mm256_blendv_ps(neg, v, _mm256_cmp_ps(v, zero, _CMP_GT_OQ)));
+    for (; i + 8 <= i1; i += 8) _mm256_storeu_ps(x + i, elu8_avx2(_mm256_loadu_ps(x + i)));
+    if (i < i1) {
+        float t[8] = {};
+        std::copy(x + i, x + i1, t);
+        _mm256_storeu_ps(t, elu8_avx2(_mm256_loadu_ps(t)));
+        std::copy(t, t + (i1 - i), x + i);
     }
-    elu_range(x, i, i1); // the last < 8 numbers
 }
 #endif
 
 void elu(float *x, size_t n) {
-    // Element-wise, so any split gives the same bits. Streaming calls are
+    // Element-wise, and every number goes through the same code (the SIMD
+    // kernels pad their leftovers), so any split gives the same bits. Streaming calls are
     // mostly 16K-130K numbers per frame: split those too (one chunk per 8K,
     // at most 32), else most of the codec's ELU runs on a single core.
     const int chunks = n < 16 * 1024 ? 1 : (int)std::min<size_t>(32, n / 8192);
